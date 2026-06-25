@@ -68,6 +68,26 @@ export function useAudio(state, utils) {
         return (Number.isFinite(secs) && secs >= 1 && secs <= 60 ? secs : 5) * 1000;
     }
 
+    // FORK CHANGE (keep-screen-video): when true, the screen-share modes
+    // ('system' / 'both') RETAIN the captured video track and record a
+    // video/webm instead of discarding video and recording audio-only.
+    // Upstream Speakr uses getDisplayMedia purely to grab system audio and
+    // always drops the video. Default false → behaviour identical to upstream.
+    // Toggle via the #app data-keep-screen-video attribute (env KEEP_SCREEN_VIDEO).
+    function _keepScreenVideo() {
+        const el = document.getElementById('app');
+        return !!el && !!el.dataset && (el.dataset.keepScreenVideo || '').toLowerCase() === 'true';
+    }
+
+    // FORK CHANGE (keep-screen-video): the recorded File's MIME type must match
+    // what MediaRecorder actually produced (video/webm when video was kept,
+    // else audio/webm). The recorded chunks carry that type, so derive from the
+    // first chunk; fall back to audio/webm. Filename stays .webm (valid for both).
+    function _recordedFileType(chunks) {
+        const t = (chunks && chunks[0] && chunks[0].type) ? String(chunks[0].type).split(';')[0] : '';
+        return (t === 'video/webm' || t === 'audio/webm') ? t : 'audio/webm';
+    }
+
     function _resetServerSessionState() {
         serverSessionId = null;
         serverSessionUploader = null;
@@ -289,6 +309,11 @@ export function useAudio(state, utils) {
             currentChunkIndex = 0;
 
             let stream;
+            // FORK CHANGE (keep-screen-video): holds the screen-share video
+            // track when _keepScreenVideo() is on, so it can be added to the
+            // final recording stream + select a video/webm mimeType below.
+            let keptVideoTrack = null;
+            const keepVideo = _keepScreenVideo();
             let combinedStream;
 
             if (mode === 'microphone') {
@@ -432,15 +457,27 @@ export function useAudio(state, utils) {
                 }
 
                 // Stop video track
-                stream.getVideoTracks().forEach(track => track.stop());
-                stream = new MediaStream([audioTrack]);
+                // FORK CHANGE (keep-screen-video): retain the video track for
+                // recording instead of stopping it. The analyser/visualiser
+                // still runs off the audio-only stream below.
+                if (keepVideo) {
+                    keptVideoTrack = stream.getVideoTracks()[0] || null;
+                } else {
+                    stream.getVideoTracks().forEach(track => track.stop());
+                }
+                const audioOnlyStream = new MediaStream([audioTrack]);
                 activeStreams.value = [stream];
 
                 audioContext.value = new (window.AudioContext || window.webkitAudioContext)();
-                const source = audioContext.value.createMediaStreamSource(stream);
+                const source = audioContext.value.createMediaStreamSource(audioOnlyStream);
                 analyser.value = audioContext.value.createAnalyser();
                 analyser.value.fftSize = 256;
                 source.connect(analyser.value);
+
+                // The recorder stream = audio + (optionally) the kept video track.
+                stream = keptVideoTrack
+                    ? new MediaStream([audioTrack, keptVideoTrack])
+                    : audioOnlyStream;
 
             } else if (mode === 'both') {
                 if (!canRecordAudio.value || !canRecordSystemAudio.value) {
@@ -491,8 +528,13 @@ export function useAudio(state, utils) {
                     );
                 }
 
-                // Stop video tracks
-                displayStream.getVideoTracks().forEach(track => track.stop());
+                // FORK CHANGE (keep-screen-video): keep the display video track
+                // for recording instead of stopping it.
+                if (keepVideo) {
+                    keptVideoTrack = displayStream.getVideoTracks()[0] || null;
+                } else {
+                    displayStream.getVideoTracks().forEach(track => track.stop());
+                }
 
                 // Create audio context and combine streams
                 audioContext.value = new (window.AudioContext || window.webkitAudioContext)();
@@ -514,13 +556,34 @@ export function useAudio(state, utils) {
 
                 combinedStream = destination.stream;
                 activeStreams.value = [micStream, displayStream];
+                // FORK CHANGE (keep-screen-video): the mixed audio destination
+                // stream is audio-only; add the kept video track so the
+                // recording is video + mixed mic/system audio.
+                if (keptVideoTrack) {
+                    combinedStream = new MediaStream([
+                        ...destination.stream.getAudioTracks(),
+                        keptVideoTrack
+                    ]);
+                }
                 stream = combinedStream;
             }
 
-            // Determine best mime type
-            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                ? 'audio/webm;codecs=opus'
-                : 'audio/webm';
+            // Determine best mime type. FORK CHANGE (keep-screen-video): when a
+            // video track was kept, record a video/webm container (vp9/vp8 +
+            // opus) so the screen video is preserved; else audio-only as upstream.
+            let mimeType;
+            if (keptVideoTrack) {
+                const videoCandidates = [
+                    'video/webm;codecs=vp9,opus',
+                    'video/webm;codecs=vp8,opus',
+                    'video/webm'
+                ];
+                mimeType = videoCandidates.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+            } else {
+                mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                    ? 'audio/webm;codecs=opus'
+                    : 'audio/webm';
+            }
 
             const recorder = new MediaRecorder(stream, { mimeType });
 
@@ -810,7 +873,7 @@ export function useAudio(state, utils) {
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.webm`, { type: 'audio/webm' });
+        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.webm`, { type: _recordedFileType(audioChunks.value) });
         // Prevent Vue from wrapping the binary File in a reactive proxy. See
         // upload.js for rationale (issue #280).
         const recordedFile = (typeof Vue !== 'undefined' && Vue.markRaw)
@@ -889,7 +952,7 @@ export function useAudio(state, utils) {
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.webm`, { type: 'audio/webm' });
+        const _rawRecordedFile = new File(audioChunks.value, `recording-${timestamp}.webm`, { type: _recordedFileType(audioChunks.value) });
         // Prevent Vue from wrapping the binary File in a reactive proxy. See
         // upload.js for rationale (issue #280).
         const recordedFile = (typeof Vue !== 'undefined' && Vue.markRaw)

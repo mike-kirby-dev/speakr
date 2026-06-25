@@ -1434,7 +1434,14 @@ def index():
         recording_chunk_seconds = 5
     recording_chunk_seconds = max(1, min(60, recording_chunk_seconds))
 
+    # FORK CHANGE (keep-screen-video): when KEEP_SCREEN_VIDEO=true, the in-app
+    # screen-share recorder ('system'/'both' modes) keeps the captured video
+    # track and records a video/webm instead of discarding video (upstream
+    # default). Off by default → behaviour identical to upstream Speakr.
+    keep_screen_video = os.environ.get('KEEP_SCREEN_VIDEO', 'false').lower() == 'true'
+
     return render_template('index.html',
+                         keep_screen_video=keep_screen_video,
                          use_asr_endpoint=USE_ASR_ENDPOINT,  # Backwards compat
                          connector_supports_diarization=connector_supports_diarization,
                          connector_supports_speaker_count=connector_supports_speaker_count,
