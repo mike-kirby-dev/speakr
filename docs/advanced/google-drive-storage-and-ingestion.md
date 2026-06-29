@@ -1,251 +1,152 @@
-# Google Drive (Workspace Shared Drive) — Storage Backend + Ingestion Design
+# Google Drive → R2 ingestion via rclone (recommended) + Drive-native alternative
 
-**Status:** Proposed design / implementation plan (no code changes yet)
-**Scope:** Add Google Drive as (1) a first-class storage backend alongside `local` and `s3`, and (2) an ingestion source that auto-triggers transcriptions, with the raw video/audio files living in a Workspace **Shared Drive**.
-**Decisions baked in:**
-- **Auth:** Service account + **Shared Drive** (the Shared Drive — not the service account — owns the storage quota, so a headless service account can write freely).
-- **Playback:** **Proxy/stream through the app** (Drive has no S3-style presigned URLs).
-- **Topology:** Drive is both the storage backend *and* the ingestion inbox, so an ingested file is **moved** into the recordings area rather than re-uploaded — one copy that never leaves Drive.
+**Status:** Design / implementation plan (no app code changes yet)
+**Goal:** Files dropped into a Google Workspace **Shared Drive** are transcribed by Speakr, with the raw video/audio retained in object storage and **S3 presigned URLs** kept for UI playback.
 
 ---
 
-## 1. Why this is feasible (and where it isn't a drop-in)
+## TL;DR — recommended architecture
 
-The storage layer (`src/services/storage/`) is already a clean, scheme-routed abstraction:
+```
+Google Shared Drive  ──(rclone, outside Speakr)──►  Cloudflare R2 bucket
+                                                        │
+                                                        ├─ inbox/    ← Speakr watches this prefix
+                                                        └─ recordings/ ← Speakr stores final media here
+                                                        │
+Speakr (FILE_STORAGE_BACKEND=s3 → R2 endpoint)  ◄───────┘
+   • existing S3 backend = storage (presigned URLs work on R2)
+   • NEW: small S3/R2 ingestion watcher → triggers transcription
+```
 
-- `interfaces.py` — `StorageLocator`, `StoredObject`, `ObjectStat`, `MaterializedFile`, `AudioDeliveryResult`
-- `local.py` / `s3.py` — backends implementing the same method surface
-- `locator.py` — parse/serialize locator strings (`local://…`, `s3://bucket/key`)
-- `factory.py` — build backends from `StorageSettings`
-- `service.py` — `StorageService` facade; routes by `locator.scheme`
+**Why this beats a direct Google Drive integration:**
 
-A recording's `audio_path` column stores a locator string, and **all** business logic (transcription, playback, delete, share) goes through `StorageService` — never a backend directly. Adding a `gdrive` backend is therefore "add one backend class + extend the locator parser + wire ~5 call sites in `service.py`/`factory.py`."
-
-**Three genuine mismatches vs. S3** (each addressed below):
-
-| Concern | S3 today | Google Drive |
+| | Direct Drive backend (previous design) | **rclone → R2 (this design)** |
 | --- | --- | --- |
-| Addressing | Computable hierarchical key path (`recordings/2024/06/123/…`) | Opaque **file IDs** + folder tree; cannot PUT to a path |
-| Public delivery | Short-lived **presigned URL**; bytes stream straight from S3 | No equivalent → **proxy bytes through Flask** with range support |
-| Ingestion lock | `os.rename` to `*.processing` (atomic on a filesystem) | Emulate via **move to a `processing/` folder** + dedupe on file ID |
+| New storage backend | `GDriveStorageBackend` (~250 lines) | **None** — R2 is S3-compatible, already supported |
+| Presigned URLs / UI playback | Lost → had to proxy/stream bytes through the app | **Kept** — R2 supports S3 presigned URLs |
+| Google API client + auth | Required (`google-api-python-client`, service account, `supportsAllDrives`) | **None in Speakr** — lives in rclone config |
+| Locator scheme | New `gdrive://<file_id>` | Existing `s3://bucket/key` |
+| Net-new Speakr code | Backend + streaming proxy + Drive monitor | **One S3/R2 ingestion watcher** |
+
+> **rclone, not rsync.** rsync only speaks local filesystem / SSH — it cannot talk to the Google Drive or S3/R2 APIs. rclone has native backends for *both* and copies directly between them. This is the right (and only) tool for the Drive→R2 hop.
+
+R2 is already usable as Speakr's storage today: `FILE_STORAGE_BACKEND=s3` with `S3_ENDPOINT_URL=https://<accountid>.r2.cloudflarestorage.com` (and typically `S3_USE_PATH_STYLE=true`). The S3 backend's `generate_presigned_url` (s3v4) works against R2, so `get_audio_delivery` keeps returning `redirect_url` and the UI is unchanged.
 
 ---
 
-## 2. Dependencies
+## Part A — rclone: Drive → R2 (outside Speakr)
 
-Add to `requirements.txt`:
+Runs as a scheduled job (cron / systemd timer / a small sidecar container) — **not** part of Speakr.
 
+### 1. Configure two rclone remotes
 ```
-google-api-python-client
-google-auth
+rclone config       # create:
+#   drive:  → type=drive,  scope=drive.readonly (service account JSON or OAuth)
+#   r2:     → type=s3, provider=Cloudflare, endpoint=https://<accountid>.r2.cloudflarestorage.com,
+#             access_key_id=…, secret_access_key=…
 ```
+For headless servers use a **service account** on the `drive:` remote (`service_account_file=…`) so no interactive OAuth refresh is needed — and a **Shared Drive** so the service account isn't blocked by My-Drive quota (`team_drive=<shared drive id>`).
 
-(Both pure-Python; no native build. `google-auth` brings `google.oauth2.service_account`.) The import is lazy inside the backend (mirroring how `s3.py` imports `boto3` only in `_get_client()`), so installs that don't use Drive pay nothing and the app still boots without the libs present.
+### 2. Move new files Drive → R2 inbox
+```
+rclone move drive:Inbox r2:speakr/inbox \
+  --transfers 4 --checkers 8 \
+  --drive-skip-gdocs --min-age 1m \
+  --log-level INFO
+```
+- **`move`** (not `sync`) drains the Drive inbox as it copies, giving natural "already processed" semantics on the Drive side and never deleting anything on R2.
+- **`--min-age 1m`** skips files still uploading to Drive (the rclone analog of Speakr's local stability check).
+- Schedule every 1–5 min via cron: `*/2 * * * * flock -n /tmp/rclone-speakr.lock rclone move …` (the `flock` prevents overlapping runs).
+
+> Alternative `rclone mount r2:speakr/inbox /data/auto-process` (FUSE) + the **existing** local `file_monitor` = zero Speakr code. Caveats: needs `--cap-add SYS_ADMIN`/`/dev/fuse` in containers, and the monitor's `os.rename` lock becomes a server-side copy+delete on object storage (works, not atomic). Fine for a single low-volume instance; the native watcher below is more robust.
 
 ---
 
-## 3. The `gdrive://` locator
+## Part B — the one Speakr change: an S3/R2 ingestion watcher
 
-Drive files are addressed by **file ID**, not path. Encode the file ID in the locator and (optionally) carry a human-readable name for logs/debugging only.
+Today `src/file_monitor.py` watches a local directory. The transcription pipeline itself is cleanly factored into **`FileMonitor._process_file(local_path, user_id, tag_id=None)`** (`file_monitor.py:312`) which does: staging copy → hash dedupe → `ffprobe` → `convert_if_needed()` → create `Recording(processing_source='auto_process', is_inbox=True)` → `storage.build_recording_key()` + upload → `job_queue.enqueue(job_type='transcribe')`.
 
-**Format:** `gdrive://<file_id>` (e.g. `gdrive://1A2b3C4d5E6f7G8h9I0j`)
+A new watcher only has to **list new R2 objects, download each, and hand its local path to that same `_process_file`.** Everything downstream is reused unchanged.
 
-Extend `src/services/storage/interfaces.py::StorageLocator`:
-- add `file_id: Optional[str] = None`
-- add `is_gdrive` property (`scheme == 'gdrive'`)
+### New module `src/s3_monitor.py` — `S3FileMonitor`
+Background daemon thread, same lifecycle (`start()`/`stop()`/loop on `check_interval`) as `FileMonitor`. Reuses the already-configured boto3 client from the S3 storage backend (`get_storage_service().s3._get_client()`), so no new dependency. Per poll:
 
-Extend `src/services/storage/locator.py`:
-- `GDRIVE_SCHEME = 'gdrive://'`
-- `build_gdrive_locator(file_id)` → `f"gdrive://{file_id}"`
-- In `parse_locator`, before the absolute-path fallback:
-  ```python
-  if raw.startswith(GDRIVE_SCHEME):
-      file_id = raw[len(GDRIVE_SCHEME):].strip().strip('/')
-      if not file_id:
-          raise ValueError(f"Invalid gdrive locator (missing file id): {raw}")
-      return StorageLocator(scheme='gdrive', raw=raw, file_id=file_id)
-  ```
+1. **List** new objects under the inbox prefix:
+   `client.list_objects_v2(Bucket=…, Prefix='inbox/')` (paginate). Skip "directory" keys.
+2. **Skip already-seen** keys: a key is "new" if not in the processed set. Track processed keys in a small DB table (or reuse the existing `file_hash` duplicate check, which already guards re-ingestion of identical content).
+3. **Claim / lock** (object storage has no atomic rename): server-side **copy** the object to a `processing/<key>` prefix then delete the inbox original (`copy_object` + `delete_object`). The copy succeeding is the claim; if it 404s, another worker already took it. (For a single Speakr instance, an in-process lock + DB seen-set is enough; the copy-to-`processing/` approach makes it safe for multiple workers.)
+4. **Download** to the staging dir (`storage.get_staging_dir()`), preserving the original filename and extension.
+5. **Run the existing pipeline:** call `monitor._process_file(local_staging_path, user_id, tag_id)`. This handles hash/probe/convert, creates the `Recording`, **uploads the final media to the `recordings/` prefix in R2**, and enqueues transcription. `audio_path` ends up an `s3://…` locator → presigned playback works.
+6. **Cleanup:** delete the `processing/<key>` object (its bytes now live under `recordings/`). On failure, leave it in `processing/` (or move to `failed/`) for inspection rather than losing it.
 
-> **Why file ID, not path:** Drive lets two files share a name in the same folder, paths aren't unique, and `files.get` is by ID. The existing `build_recording_key()` (year/month/recording-id naming) is still used — but as the **Drive filename + folder layout**, not as an addressable key.
+**Optimization — adopt in place (avoid re-uploading bytes):** since the file is *already* in R2, when `convert_if_needed()` makes no changes, skip the re-upload: server-side **`copy_object`** from `processing/<key>` to the computed `recordings/<key>` and set `audio_path` directly. Only when conversion produces a new file do we upload the converted output. This is a small branch in/around `_process_file`; ship the simple "download → `_process_file` (re-uploads)" version first, add this later.
+
+### Modes & tags
+Reuse the existing `AUTO_PROCESS_MODE` semantics. In R2, "user directories" = key sub-prefixes like `inbox/user<id>/…`; auto-process **tag** folders = `inbox/<tag-folder>/…`, mapped exactly as the local monitor maps sub-directories today.
+
+### Startup wiring
+Mirror `start_file_monitor()` (`file_monitor.py:553`) and `initialize_file_monitor()` (`config/startup.py:15`). Add `initialize_s3_monitor(app)` to `run_startup_tasks()`, gated on its own switch so it's independent of the local monitor:
+```
+ENABLE_S3_INGEST=true
+S3_INGEST_PREFIX=inbox/
+S3_INGEST_CHECK_INTERVAL=60        # R2 list calls are cheap; 30–120s is reasonable
+S3_INGEST_MODE=admin_only          # admin_only | user_directories | single_user
+S3_INGEST_DEFAULT_USERNAME=…       # for single_user
+```
+
+> **Even cheaper than polling (later):** R2 supports **event notifications** to a Cloudflare Queue. A consumer could hit a Speakr endpoint when an object lands, eliminating the poll loop. Keep the watcher's "list new keys" behind one function so this is a drop-in swap.
 
 ---
 
-## 4. `GDriveStorageBackend` (new: `src/services/storage/gdrive.py`)
+## Part C — configuration summary
 
-Mirror the `S3StorageBackend` shape exactly so `StorageService` can treat it like any other backend. Lazy client init like `s3.py::_get_client()`.
-
-```python
-class GDriveStorageBackend:
-    def __init__(self, *, shared_drive_id, root_folder_id, credentials_json_path=None,
-                 credentials_json_inline=None, subject=None, key_prefix='recordings'):
-        ...
-        self._service = None  # googleapiclient discovery 'drive' v3
-
-    def _get_service(self):
-        # google.oauth2.service_account.Credentials.from_service_account_file/info
-        # scopes=['https://www.googleapis.com/auth/drive']
-        # optional .with_subject(subject) for domain-wide delegation
-        # build('drive', 'v3', credentials=creds, cache_discovery=False)
-        ...
+**Storage (already supported — point Speakr at R2):**
+```
+FILE_STORAGE_BACKEND=s3
+S3_BUCKET_NAME=speakr
+S3_ENDPOINT_URL=https://<accountid>.r2.cloudflarestorage.com
+S3_ACCESS_KEY_ID=…
+S3_SECRET_ACCESS_KEY=…
+S3_USE_PATH_STYLE=true
+FILE_STORAGE_KEY_PREFIX=recordings        # final media under recordings/
+S3_PRESIGN_TTL_SECONDS=900                 # UI playback signed-URL TTL
 ```
 
-### Method-by-method mapping to the storage interface
+**Ingestion (new):** the `ENABLE_S3_INGEST` block above.
 
-| Interface method | Drive implementation |
-| --- | --- |
-| `build_locator(key)` | Can't build a locator from a key pre-upload (no file ID yet). Used only as a fallback; real locator comes from `upload_local_file`'s returned `StoredObject`. See note below. |
-| `upload_local_file(local_path, key, content_type, metadata, delete_source)` | Ensure folder path (`recordings/YYYY/MM/<rec_id>/`) exists via `_ensure_folder_path(key)` → returns parent folder ID. **Resumable** `files().create(media_body=MediaFileUpload(..., resumable=True), body={'name': basename, 'parents': [folder_id]}, supportsAllDrives=True, fields='id,size,mimeType,md5Checksum')`. Return `StoredObject(locator='gdrive://'+id, key=key, size=…, content_type=…, etag=md5Checksum)`. |
-| `save_fileobj(fileobj, key, …)` | Same as above with `MediaIoBaseUpload`. |
-| `exists(locator)` | `files().get(fileId=locator.file_id, fields='id, trashed', supportsAllDrives=True)` → True unless 404 or `trashed`. |
-| `stat(locator)` | `files().get(fields='size,modifiedTime,md5Checksum,mimeType', supportsAllDrives=True)` → `ObjectStat`. |
-| `delete(locator, missing_ok)` | `files().delete(fileId=…, supportsAllDrives=True)` (or move-to-trash). Swallow 404 when `missing_ok`. |
-| `materialize(locator)` | `MediaIoBaseDownload` chunked download to a `tempfile.mkstemp(...)` → `MaterializedFile(local_path, cleanup_required=True)`. Identical contract to S3 so the transcription pipeline is unchanged. |
-| **`open_stream(locator, range_header)`** *(new)* | Returns a file-like / generator of bytes for proxy playback (see §5). Supports HTTP `Range`. |
-
-> **Folder management (`_ensure_folder_path`)**: split the key on `/`, walk/create each folder under `root_folder_id` using `files().list(q="name='…' and '<parent>' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='drive', driveId=<shared_drive_id>)`; create missing with `mimeType='application/vnd.google-apps.folder'`. Cache folder IDs in-process to avoid repeated lookups (a simple `dict` keyed by relative folder path). All calls pass `supportsAllDrives=True`; all `list` calls also pass `includeItemsFromAllDrives=True`, `corpora='drive'`, `driveId=<shared_drive_id>`.
+**rclone (outside Speakr):** the `drive:` + `r2:` remotes and the scheduled `rclone move`.
 
 ---
 
-## 5. Playback — proxy/stream through the app
-
-S3 returns `AudioDeliveryResult(mode='redirect_url', url=<presigned>)`; the API 302-redirects (`recordings.py:3666`, `api_v1.py:2531`, `shares.py:161`). Drive has no presigned URL, so add a **third delivery mode** rather than forcing a download-to-temp on every play.
-
-### 5.1 Extend `AudioDeliveryResult`
-In `interfaces.py`, document a new `mode` value `stream` and add fields:
-```python
-mode: str  # local_file | redirect_url | stream
-stream_locator: Optional[str] = None   # gdrive:// locator to stream
-size: Optional[int] = None
-```
-
-### 5.2 `StorageService.get_audio_delivery`
-Add a branch before the S3 presign path:
-```python
-if resolved.kind == 'gdrive':
-    st = resolved.backend.stat(resolved.locator)
-    return AudioDeliveryResult(mode='stream', stream_locator=locator_value,
-                               mimetype=mime_type, size=st.size)
-```
-
-### 5.3 API handlers (3 call sites)
-At each consumer (`recordings.py`, `api_v1.py`, `shares.py`), add a `mode == 'stream'` branch that proxies bytes with **range support** (audio scrubbing needs `206 Partial Content`). Centralize in one helper, e.g. `src/api/_audio_proxy.py::stream_gdrive_audio(locator, mimetype, size, download_name)`:
-- Parse `Range` header → start/end.
-- Call `backend.open_stream(locator, start, end)`.
-- Return a Flask `Response(generator, status=206|200, headers={Content-Range, Accept-Ranges: bytes, Content-Length, Content-Type, Content-Disposition?})`.
-
-Drive supports byte ranges on media downloads (the `Range` header on `alt=media`, or `MediaIoBaseDownload` chunking), so seeking works without pulling the whole file.
-
-**Trade-off to accept:** all playback/download bandwidth flows through the app process (unlike the S3 offload). For a self-hosted Workspace deployment this is usually fine; document it. A future optimization is a short-lived signed proxy URL or Drive `webContentLink`, deliberately out of scope here.
-
----
-
-## 6. Factory + settings wiring
-
-`src/config/app_config.py` — add env parsing (next to the `S3_*` block, lines ~90–104):
-```
-FILE_STORAGE_BACKEND = 'gdrive'                      # now accepts local | s3 | gdrive
-GDRIVE_SHARED_DRIVE_ID
-GDRIVE_ROOT_FOLDER_ID                                # folder (inside the Shared Drive) that holds recordings/
-GDRIVE_CREDENTIALS_JSON                              # path to service-account JSON
-GDRIVE_CREDENTIALS_JSON_INLINE                       # OR inline JSON (for secret-managers); one of the two
-GDRIVE_DELEGATED_SUBJECT                             # optional: user email for domain-wide delegation
-```
-
-`src/services/storage/factory.py`:
-- Add the `gdrive_*` fields to `StorageSettings`.
-- `build_gdrive_backend(settings) -> Optional[GDriveStorageBackend]` (returns `None` if `shared_drive_id`/`root_folder_id` unset, mirroring `build_s3_backend`).
-
-`src/services/storage/service.py`:
-- `__init__`: `self.gdrive = build_gdrive_backend(self.settings)`.
-- `_resolve_backend_for_locator`: route `scheme == 'gdrive'` → `self.gdrive` (raise if unconfigured, like the S3 branch).
-- `upload_local_file` and `build_default_locator`: add a `backend == 'gdrive'` branch.
-- `get_audio_delivery`: add the `stream` branch from §5.2.
-
-No other business logic changes — `materialize()` (used by the transcription worker at `services/job_queue.py`) is backend-agnostic already.
-
----
-
-## 7. Ingestion — `GDriveFileMonitor` (new)
-
-`src/file_monitor.py` is **not** abstracted like storage — it's hardwired to a local `Path` and uses `os.rename` locking. So ingestion is **net-new code**, but everything downstream of "a file is sitting in the staging dir" is fully reused: hashing (`utils/file_hash`), `ffprobe`, `convert_if_needed()`, `Recording` creation, and `job_queue.enqueue(job_type='transcribe')`.
-
-### 7.1 New class `GDriveFileMonitor` (own module, e.g. `src/gdrive_monitor.py`)
-Background daemon thread, same lifecycle as `FileMonitor` (`start()`/`stop()`/loop on `check_interval`). Per poll:
-
-1. **List new files** in the configured inbox folder:
-   `files().list(q="'<inbox_folder_id>' in parents and trashed=false", fields='files(id,name,size,mimeType,modifiedTime,md5Checksum)', supportsAllDrives=True, includeItemsFromAllDrives=True, corpora='drive', driveId=<shared_drive_id>)`.
-   Skip sub-folders (`mimeType == application/vnd.google-apps.folder`).
-2. **Stability check** — compare `size`/`modifiedTime` to the previous poll (Drive analog of the local size-stability check) so partially-uploaded files are skipped.
-3. **Claim/lock** — `files().update(fileId=…, addParents=<processing_folder_id>, removeParents=<inbox_folder_id>, supportsAllDrives=True)`. The move is the atomic claim (replaces `rename → *.processing`). If another worker already moved it, the update 404s → skip.
-4. **Download** to the existing staging dir (`storage.get_staging_dir()`), then hand to the **existing pipeline** — reuse the body of `FileMonitor`'s per-file processing (hash, probe, `convert_if_needed`, create `Recording` with `processing_source='auto_process'`, `is_inbox=True`, apply tag if the file came from a tag sub-folder, `job_queue.enqueue`).
-5. **Store (move, don't re-upload):** since Drive is also the storage backend, after the `Recording` row exists, **move the original Drive file** into the recordings folder (`_ensure_folder_path(build_recording_key(...))`) and set `recording.audio_path = 'gdrive://' + file_id`. The only time we re-upload is when conversion/compression produced a *new* file (codec/size constraints from the active connector); then upload the converted output and trash the original.
-6. **Dedupe** — record processed Drive file IDs (and the existing `file_hash` duplicate detection) so a file is never ingested twice. A small `processed/` folder move + the existing hash check both guard this.
-
-### 7.2 Modes
-Reuse the existing `AUTO_PROCESS_MODE` semantics (`admin_only` / `user_directories` / `single_user`). In Drive, "user directories" = sub-folders of the inbox folder named `user<id>` (resolved via `files().list`). Tag sub-folders work the same way (the existing `is_auto_process` tag → folder mapping, just resolved by Drive folder instead of `Path`).
-
-### 7.3 Startup wiring
-Mirror `start_file_monitor()` (`file_monitor.py:553`) and `initialize_file_monitor()` (`config/startup.py:15`). Add a sibling `initialize_gdrive_monitor(app)` called from `run_startup_tasks()`, gated on a new master switch so the two ingestors are independent:
-```
-ENABLE_GDRIVE_INGEST=true
-GDRIVE_INGEST_FOLDER_ID=<inbox folder id>
-GDRIVE_INGEST_CHECK_INTERVAL=60
-GDRIVE_INGEST_MODE=admin_only
-```
-
-> **Polling vs. push:** v1 uses simple polling (`GDRIVE_INGEST_CHECK_INTERVAL`, default 60s — Drive API quota is ~queries/100s so don't go too low). A later upgrade is the Drive **Changes API** (`changes.list` + a saved `startPageToken`) or **push channels** (`files.watch` webhook) for near-real-time and far fewer API calls. Design the poll loop around a pluggable "list new file IDs since last check" function so swapping in Changes API later is localized.
-
----
-
-## 8. Google Workspace setup (operator runbook)
-
-1. **Create a service account** in Google Cloud Console; download the JSON key. Enable the **Google Drive API** on the project.
-2. **Create a Shared Drive** in Workspace (storage is owned by the org, not the service account — this is the crux that makes a headless service account viable; service accounts have *no* usable My Drive quota).
-3. **Add the service account** (its `...@...iam.gserviceaccount.com` email) as a **member of the Shared Drive** with **Content manager** (or Manager) access.
-4. Inside the Shared Drive, create:
-   - a **recordings root folder** → `GDRIVE_ROOT_FOLDER_ID`
-   - an **inbox folder** → `GDRIVE_INGEST_FOLDER_ID` (+ a `processing/` and `processed/` subfolder, auto-created on first run)
-5. Set env: `FILE_STORAGE_BACKEND=gdrive`, `GDRIVE_SHARED_DRIVE_ID`, `GDRIVE_ROOT_FOLDER_ID`, `GDRIVE_CREDENTIALS_JSON=/path/to/key.json`, and (for ingestion) `ENABLE_GDRIVE_INGEST=true`, `GDRIVE_INGEST_FOLDER_ID`.
-6. *(Optional)* **Domain-wide delegation** — only if you need files to appear *owned by a specific human user* rather than the service account. Authorize the client ID for scope `https://www.googleapis.com/auth/drive` in the Admin console, set `GDRIVE_DELEGATED_SUBJECT=user@yourdomain.com`. Not required for the Shared-Drive model.
-
-**Scopes:** `https://www.googleapis.com/auth/drive` (read/write across the Shared Drive). `drive.file` is insufficient because it only sees files the app itself created — it would break ingesting files dropped by users.
-
----
-
-## 9. Files touched / added (summary)
+## Files touched (this design)
 
 **New:**
-- `src/services/storage/gdrive.py` — `GDriveStorageBackend`
-- `src/gdrive_monitor.py` — `GDriveFileMonitor` + `start_gdrive_monitor()`
-- `src/api/_audio_proxy.py` — shared range-streaming helper
-- `docs/admin-guide/google-drive.md` — operator docs + env reference (this file is the design; that would be the user-facing how-to)
-- `config/env.gdrive.example` — sample env
+- `src/s3_monitor.py` — `S3FileMonitor` + `start_s3_monitor()`
+- `config/env.r2-ingest.example` — sample storage + ingest env
+- `docs/admin-guide/google-drive-r2-ingestion.md` — operator how-to (rclone setup + Speakr config)
 
 **Edited:**
-- `src/services/storage/interfaces.py` — `StorageLocator.file_id`/`is_gdrive`; `AudioDeliveryResult` `stream` mode + fields
-- `src/services/storage/locator.py` — `gdrive://` parse/build
-- `src/services/storage/factory.py` — settings fields + `build_gdrive_backend`
-- `src/services/storage/service.py` — resolve/upload/delivery branches
-- `src/config/app_config.py` — `GDRIVE_*` env parsing
-- `src/config/startup.py` — `initialize_gdrive_monitor`
-- `src/api/recordings.py`, `src/api/api_v1.py`, `src/api/shares.py` — `mode == 'stream'` branch
-- `requirements.txt` — Google libs
+- `src/config/app_config.py` — parse `S3_INGEST_*` / `ENABLE_S3_INGEST`
+- `src/config/startup.py` — `initialize_s3_monitor`
+- *(optional refactor)* `src/file_monitor.py` — extract `_process_file` enough to call it from the S3 watcher (it already takes a local path, so this may be zero-change)
+
+**No changes needed** to the storage backend, locators, playback/delivery, or the UI.
 
 ---
 
-## 10. Testing
+## Testing
+- **Unit (mock boto3):** `list_objects_v2` returns a new key → assert download → `_process_file` invoked → `Recording(processing_source='auto_process')` created and `transcribe` job enqueued; assert `audio_path` is an `s3://` locator. Test the copy-to-`processing/` claim and the seen-set dedupe.
+- **Presigned playback:** confirm `get_audio_delivery` returns `mode='redirect_url'` against the R2 endpoint and the URL is fetchable.
+- **rclone (integration):** drop a file in the Drive inbox → it appears in `r2:speakr/inbox` → Speakr ingests → transcription appears → plays back via signed URL.
 
-- **Unit (no network):** mock the Drive `service` object; test locator parse/build, `_ensure_folder_path` caching, `upload_local_file` → `StoredObject`, `materialize` temp-file contract, range math in the proxy helper.
-- **Backend conformance:** reuse the existing storage tests against a faked Drive client so `gdrive` satisfies the same contract as `local`/`s3`.
-- **Ingestion:** mock `files().list` returning a new file → assert `Recording` created with `processing_source='auto_process'` and a `transcribe` job enqueued; assert the "move not re-upload" path sets `audio_path='gdrive://…'`.
-- **Manual/integration:** a real service account + a throwaway Shared Drive folder; drop an audio file → transcription appears; play back (verify `206` range responses in the network tab); download.
+## Risks / notes
+- **Two hops of latency:** Drive→R2 (rclone schedule) + R2 poll interval. Tune both; or use rclone more frequently + R2 event notifications for near-real-time.
+- **Duplicate suppression:** rely on the existing `file_hash` check plus the processed-key set so a re-listed object isn't ingested twice.
+- **rclone runs outside Speakr:** it needs its own deployment (cron/systemd/sidecar) and the Drive service-account credentials live there, not in Speakr — a cleaner security boundary.
+- **R2 specifics:** use path-style addressing; R2 ignores AWS regions (any region string is fine for signing). Presigned URLs and `copy_object` (server-side copy) are both supported.
 
 ---
 
-## 11. Risks / open questions
+## Appendix — Drive-native backend (previous design, not recommended)
 
-- **Bandwidth through the app** for playback (accepted trade-off vs. S3 offload). Revisit if a deployment is playback-heavy.
-- **API quotas** — default Drive quota is generous but polling intervals and large fan-out ingestion should respect it; move to Changes API/push if needed.
-- **Large files** — must use resumable upload + chunked download (designed in). Workspace per-file limits are far above typical recordings.
-- **Eventual consistency** — a freshly created folder may take a beat to appear in `list`; the folder-ID cache + create-on-demand avoids racing on this.
-- **Shared Drive member access** — if an admin removes the service account from the Shared Drive, all storage ops fail; surface a clear health/error message (the existing `RuntimeError('… backend is not configured')` pattern).
+The earlier revision of this document specified a direct `GDriveStorageBackend` + `gdrive://` locator + a byte-streaming playback proxy + a `GDriveFileMonitor`, because Google Drive has no S3-style presigned URLs and addresses files by opaque ID. That approach works but pushes all playback bandwidth through the app and adds a Google API client and ~3 new components. The rclone→R2 design above supersedes it: it keeps presigned-URL playback, reuses the existing S3 backend wholesale, and reduces the Speakr change to a single ingestion watcher. The Drive-native notes are retained in git history (previous commit on this branch) if a no-R2, Drive-only deployment is ever required.
