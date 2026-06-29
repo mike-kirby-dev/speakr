@@ -50,11 +50,6 @@ class S3FileMonitor:
         self.logger = logging.getLogger('s3_monitor')
         self.logger.setLevel(logging.INFO)
 
-        # Keys we've already claimed this process lifetime (claim is also
-        # enforced atomically by the copy-to-processing/ step; this set just
-        # avoids re-listing churn within a process).
-        self._seen_keys = set()
-
         # Reuse the local monitor purely for its user-cache + _process_file.
         # It never starts its own thread; we only borrow its methods.
         from src.file_monitor import FileMonitor
@@ -120,12 +115,18 @@ class S3FileMonitor:
         for page in paginator.paginate(Bucket=bucket, Prefix=self.inbox_prefix):
             for obj in page.get('Contents', []) or []:
                 key = obj['Key']
-                # Skip "directory" placeholder keys and anything already seen.
+                # Skip "directory" placeholder keys and zero-byte objects.
                 if key.endswith('/') or obj.get('Size', 0) == 0:
                     continue
-                if key in self._seen_keys:
-                    continue
-                self._seen_keys.add(key)
+                # NB: we deliberately do NOT keep a permanent in-process
+                # "seen" set. The watcher is single-instance (flock) and each
+                # _ingest_key runs to completion (claim removes the object from
+                # inbox/) before the next, so a successful ingest never re-lists.
+                # A re-appearing object (e.g. a read-only Drive SA that can't
+                # move-delete the source, so rclone re-copies it) is handled by
+                # the content-hash dedup in _ingest_key — it gets claimed,
+                # recognised as a duplicate, and dropped. A permanent seen-set
+                # would instead orphan such re-copies in inbox/ forever.
                 try:
                     self._ingest_key(client, bucket, key)
                 except Exception as e:
@@ -191,7 +192,7 @@ class S3FileMonitor:
         if not user_id:
             self.logger.warning(
                 f"No target user for inbox object '{key}' in mode '{self.mode}'; skipping")
-            self._seen_keys.discard(key)  # allow retry once config/users change
+            # Left in inbox/ — retried on the next scan once config/users change.
             return
 
         # --- Claim: server-side copy inbox -> processing/, then delete inbox ---

@@ -9,7 +9,9 @@ verify the parts of the design that are pure object-store mechanics:
 - S3StorageBackend.copy_object issues a server-side copy and sets ContentType
   via MetadataDirective=REPLACE.
 - S3FileMonitor._scan_once lists the inbox prefix, skips directory/zero-byte
-  keys and already-seen keys, and ingests genuinely new ones exactly once.
+  keys, and hands real objects to _ingest_key.
+- Single-instance flock: only one gunicorn worker runs the watcher.
+- Content dedup: a re-copied identical file is hash-skipped, not re-ingested.
 - _ingest_key claims via copy-to-processing/ + delete-inbox, downloads, calls
   _process_file with the right source_s3_key/original_filename_override, and
   cleans up the processing/ object on success.
@@ -99,7 +101,6 @@ def _make_monitor(mode='admin_only', bucket='speakr-recordings'):
     mon.thread = None
     import logging
     mon.logger = logging.getLogger('s3_monitor_test')
-    mon._seen_keys = set()
     mon._fm = MagicMock()
     mon._bucket = bucket
     return mon
@@ -112,7 +113,13 @@ def test_norm_prefix():
     assert S3FileMonitor._norm_prefix('') == ''
 
 
-def test_scan_skips_dirs_zerobyte_and_seen():
+def test_scan_skips_dirs_and_zerobyte_ingests_real():
+    """Scan ingests real objects, skips directory placeholders + zero-byte keys.
+
+    There is no permanent seen-set anymore: each real object is handed to
+    _ingest_key, which removes it from inbox/ on success or hash-skips a
+    re-copy. The scan's only filtering is dir/zero-byte.
+    """
     mon = _make_monitor()
     fake_client = MagicMock()
     paginator = MagicMock()
@@ -120,21 +127,18 @@ def test_scan_skips_dirs_zerobyte_and_seen():
         'Contents': [
             {'Key': 'inbox/', 'Size': 0},              # directory placeholder
             {'Key': 'inbox/empty.mp3', 'Size': 0},     # zero-byte
-            {'Key': 'inbox/already.mp3', 'Size': 10},  # already seen
-            {'Key': 'inbox/new.mp3', 'Size': 20},      # the only real one
+            {'Key': 'inbox/a.mp3', 'Size': 10},        # real
+            {'Key': 'inbox/b.mp3', 'Size': 20},        # real
         ]
     }]
     fake_client.get_paginator.return_value = paginator
-    mon._seen_keys.add('inbox/already.mp3')
 
     ingested = []
     with patch.object(mon, '_client_and_bucket', return_value=(fake_client, 'speakr-recordings')), \
          patch.object(mon, '_ingest_key', side_effect=lambda c, b, k: ingested.append(k)):
         mon._scan_once()
 
-    assert ingested == ['inbox/new.mp3'], f"unexpected ingest set: {ingested}"
-    # new.mp3 now tracked as seen
-    assert 'inbox/new.mp3' in mon._seen_keys
+    assert ingested == ['inbox/a.mp3', 'inbox/b.mp3'], f"unexpected ingest set: {ingested}"
 
 
 def test_resolve_admin_only():
@@ -216,14 +220,12 @@ def test_ingest_moves_to_failed_on_pipeline_error():
 def test_ingest_skips_object_with_no_user():
     mon = _make_monitor(mode='admin_only')
     fake_client = MagicMock()
-    mon._seen_keys.add('inbox/foo.mp3')
 
     with patch.object(mon, '_resolve_user_and_tag', return_value=(None, None)):
         mon._ingest_key(fake_client, 'speakr-recordings', 'inbox/foo.mp3')
 
+    # Not claimed (left in inbox/ for retry once a valid user exists).
     assert not fake_client.copy_object.called, "claimed an object with no target user"
-    # Allowed to retry later once config/users change
-    assert 'inbox/foo.mp3' not in mon._seen_keys
 
 
 def test_ingest_skips_duplicate_content():
@@ -289,7 +291,7 @@ def main():
     print("=== S3/R2 ingestion watcher ===\n")
     run("copy_object is server-side + sets ContentType", test_copy_object_is_server_side_and_sets_content_type)
     run("_norm_prefix normalises", test_norm_prefix)
-    run("scan skips dirs/zero-byte/seen, ingests new once", test_scan_skips_dirs_zerobyte_and_seen)
+    run("scan skips dirs+zero-byte, ingests real", test_scan_skips_dirs_and_zerobyte_ingests_real)
     run("resolve admin_only -> admin user", test_resolve_admin_only)
     run("resolve user_directories -> user from prefix", test_resolve_user_directories)
     run("resolve user_directories invalid user -> None", test_resolve_user_directories_invalid_user)
