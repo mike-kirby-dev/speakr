@@ -226,6 +226,65 @@ def test_ingest_skips_object_with_no_user():
     assert 'inbox/foo.mp3' not in mon._seen_keys
 
 
+def test_ingest_skips_duplicate_content():
+    """A re-copied identical file (hash already a Recording) must NOT re-ingest.
+
+    Guards the read-only-SA re-copy loop: rclone can't move-delete from Drive,
+    so the same object reappears in inbox/ every run.
+    """
+    mon = _make_monitor(mode='admin_only')
+    fake_client = MagicMock()
+    storage = MagicMock()
+    storage.get_staging_dir.return_value = '/tmp'
+
+    with patch.object(mon, '_resolve_user_and_tag', return_value=(7, None)), \
+         patch.object(mon, '_storage', return_value=storage), \
+         patch.object(mon, '_is_duplicate', return_value=True), \
+         patch('time.time', return_value=1000):
+        mon._ingest_key(fake_client, 'speakr-recordings', 'inbox/dup.mp3')
+
+    # Claimed + downloaded, but pipeline NOT run, and processing/ cleaned up.
+    assert not mon._fm._process_file.called, "duplicate content should not be re-ingested"
+    del_keys = [c.kwargs.get('Key') for c in fake_client.delete_object.call_args_list]
+    assert 'processing/dup.mp3' in del_keys, "duplicate's processing/ object should be dropped"
+
+
+def test_single_instance_lock_only_one_winner():
+    """Two processes/threads contending for the ingest lock — only one wins.
+
+    Simulates the gunicorn multi-worker case that caused triple-ingestion:
+    the flock must let exactly one caller proceed.
+    """
+    import importlib, tempfile, os as _os
+    import src.s3_monitor as sm
+    # Fresh module state + a temp lock path so we don't collide with a real run.
+    importlib.reload(sm)
+    lock = _os.path.join(tempfile.mkdtemp(), "ingest.lock")
+    _os.environ["S3_INGEST_LOCK_PATH"] = lock
+
+    class _App:
+        class logger:
+            @staticmethod
+            def info(*a, **k): pass
+            @staticmethod
+            def warning(*a, **k): pass
+
+    # First caller wins and holds the fd.
+    first = sm._acquire_single_instance_lock(_App)
+    assert first is True, "first caller should win the lock"
+
+    # A second, independent process must fail the non-blocking lock. We fork so
+    # the flock is genuinely cross-process (flock is per-open-fd / per-process).
+    pid = _os.fork()
+    if pid == 0:
+        # child: fresh module so _s3_ingest_lock_fh is None here
+        import importlib as _il, src.s3_monitor as _sm
+        _il.reload(_sm)
+        _os._exit(0 if _sm._acquire_single_instance_lock(_App) is False else 1)
+    _, status = _os.waitpid(pid, 0)
+    assert _os.WEXITSTATUS(status) == 0, "second process should NOT win the lock while first holds it"
+
+
 def main():
     print("=== S3/R2 ingestion watcher ===\n")
     run("copy_object is server-side + sets ContentType", test_copy_object_is_server_side_and_sets_content_type)
@@ -237,6 +296,8 @@ def main():
     run("ingest claims, downloads, processes, cleans up", test_ingest_claims_downloads_processes_and_cleans_up)
     run("ingest moves to failed/ on pipeline error", test_ingest_moves_to_failed_on_pipeline_error)
     run("ingest skips object with no target user", test_ingest_skips_object_with_no_user)
+    run("ingest skips duplicate content (re-copy)", test_ingest_skips_duplicate_content)
+    run("single-instance lock: only one worker wins", test_single_instance_lock_only_one_winner)
 
     print(f"\nResults: {PASSED} passed, {FAILED} failed")
     return 0 if FAILED == 0 else 1

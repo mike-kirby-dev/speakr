@@ -223,6 +223,22 @@ class S3FileMonitor:
             self._move_to_failed(client, bucket, processing_key, rel_key)
             return
 
+        # --- Content dedup: skip if this exact file is already a recording ---
+        # Belt-and-braces alongside the single-instance lock: if the upstream
+        # rclone job re-copies the same file into inbox/ (e.g. a read-only Drive
+        # service account can't `move`-delete the source, so it re-copies every
+        # run), we must NOT create a duplicate recording. The local monitor only
+        # *warns* on a hash match (by design); for object-store ingestion we hard
+        # skip — drop the processing/ object and move on.
+        if self._is_duplicate(local_path, user_id):
+            self.logger.info(f"Skipping {key}: identical content already ingested (file_hash match)")
+            try:
+                client.delete_object(Bucket=bucket, Key=processing_key)
+            except ClientError:
+                pass
+            self._safe_unlink(local_path)
+            return
+
         # --- Run the existing pipeline, adopting in place when possible ---
         try:
             self._fm._process_file(
@@ -250,6 +266,24 @@ class S3FileMonitor:
         self._safe_unlink(local_path)
         self.logger.info(f"Ingested {key} successfully")
 
+    def _is_duplicate(self, local_path, user_id):
+        """True if a Recording with this file's content hash already exists.
+
+        Uses the same SHA-256 the pipeline computes (on the original bytes,
+        pre-conversion), so a re-copied identical file is recognised.
+        """
+        try:
+            from src.utils.file_hash import compute_file_sha256
+            file_hash = compute_file_sha256(str(local_path))
+        except Exception as e:
+            self.logger.warning(f"Could not hash {local_path} for dedup: {e}")
+            return False
+        if not file_hash:
+            return False
+        from src.app import app, Recording
+        with app.app_context():
+            return Recording.query.filter_by(user_id=user_id, file_hash=file_hash).first() is not None
+
     def _move_to_failed(self, client, bucket, processing_key, rel_key):
         from botocore.exceptions import ClientError
         failed_key = self.failed_prefix + rel_key
@@ -273,6 +307,34 @@ class S3FileMonitor:
 # Global instance + lifecycle (mirrors file_monitor.py) ---------------------
 
 s3_monitor = None
+
+# Single-instance guard. Under gunicorn there are N worker processes, each of
+# which runs run_startup_tasks() and would otherwise start its own watcher —
+# N watchers racing on the same inbox/ objects produce duplicate ingests (the
+# copy-to-processing claim is NOT atomic across processes, unlike the local
+# monitor's os.rename). We hold an exclusive flock for the lifetime of the
+# winning process; the other workers fail the non-blocking lock and skip.
+_s3_ingest_lock_fh = None
+
+
+def _acquire_single_instance_lock(app):
+    """Return True iff this process won the cross-worker ingestion lock."""
+    global _s3_ingest_lock_fh
+    if _s3_ingest_lock_fh is not None:
+        return True  # already held by this process
+    import fcntl
+    lock_path = os.environ.get('S3_INGEST_LOCK_PATH', '/tmp/speakr-s3-ingest.lock')
+    try:
+        fh = open(lock_path, 'w')
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        # Another worker holds it — this worker must not start a second watcher.
+        app.logger.info("S3 ingestion watcher: another worker holds the lock; not starting here")
+        return False
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _s3_ingest_lock_fh = fh  # keep the fd open for the process lifetime to hold the lock
+    return True
 
 
 def start_s3_monitor():
@@ -301,6 +363,10 @@ def start_s3_monitor():
     valid_modes = ['admin_only', 'user_directories', 'single_user']
     if mode not in valid_modes:
         app.logger.error(f"Invalid S3_INGEST_MODE: {mode}. Must be one of: {valid_modes}")
+        return
+
+    # Only ONE worker process may run the watcher (see _s3_ingest_lock_fh).
+    if not _acquire_single_instance_lock(app):
         return
 
     check_interval = int(os.environ.get('S3_INGEST_CHECK_INTERVAL', '60'))
