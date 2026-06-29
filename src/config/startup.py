@@ -22,6 +22,15 @@ def initialize_file_monitor(app):
     except Exception as e:
         app.logger.warning(f"File monitor initialization failed: {e}")
 
+def initialize_s3_monitor(app):
+    """Initialize the S3/R2 ingestion watcher (independent of the local monitor)."""
+    try:
+        import src.s3_monitor as s3_monitor
+        s3_monitor.start_s3_monitor()
+        app.logger.info("S3 ingestion watcher initialization completed")
+    except Exception as e:
+        app.logger.warning(f"S3 ingestion watcher initialization failed: {e}")
+
 def get_file_monitor_functions(app):
     """Get file monitor functions, handling import errors gracefully."""
     try:
@@ -219,6 +228,10 @@ def run_startup_tasks(app):
 
         # Initialize file monitor after app setup
         initialize_file_monitor(app)
+
+        # Initialize S3/R2 ingestion watcher (gated on ENABLE_S3_INGEST,
+        # independent of the local file monitor)
+        initialize_s3_monitor(app)
 
         # Initialize file exporter
         initialize_file_exporter(app)

@@ -103,6 +103,18 @@ S3_VERIFY_SSL = os.environ.get('S3_VERIFY_SSL', 'true').lower() == 'true'
 S3_PRESIGN_TTL_SECONDS = int(os.environ.get('S3_PRESIGN_TTL_SECONDS', '900'))
 S3_PRESIGN_PUBLIC_TTL_SECONDS = int(os.environ.get('S3_PRESIGN_PUBLIC_TTL_SECONDS', '300'))
 
+# S3/R2 ingestion watcher (src/s3_monitor.py). When enabled, Speakr polls an
+# inbox/ prefix of the S3/R2 bucket for new objects (e.g. dropped there by an
+# external rclone job from a Google Shared Drive) and ingests them through the
+# same pipeline as the local file monitor. Only valid with FILE_STORAGE_BACKEND=s3.
+ENABLE_S3_INGEST = os.environ.get('ENABLE_S3_INGEST', 'false').lower() == 'true'
+S3_INGEST_PREFIX = os.environ.get('S3_INGEST_PREFIX', 'inbox/')
+S3_INGEST_PROCESSING_PREFIX = os.environ.get('S3_INGEST_PROCESSING_PREFIX', 'processing/')
+S3_INGEST_FAILED_PREFIX = os.environ.get('S3_INGEST_FAILED_PREFIX', 'failed/')
+S3_INGEST_CHECK_INTERVAL = int(os.environ.get('S3_INGEST_CHECK_INTERVAL', '60'))
+S3_INGEST_MODE = os.environ.get('S3_INGEST_MODE', 'admin_only')  # admin_only | user_directories | single_user
+S3_INGEST_DEFAULT_USERNAME = os.environ.get('S3_INGEST_DEFAULT_USERNAME', '').strip() or None
+
 # Unsupported codecs - comma-separated list of codecs to exclude from the default supported list
 # Useful when your transcription service doesn't support certain codecs (e.g., vllm doesn't support opus)
 # Example: AUDIO_UNSUPPORTED_CODECS=opus,vorbis

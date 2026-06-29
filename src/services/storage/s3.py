@@ -104,6 +104,30 @@ class S3StorageBackend:
         stat = self.stat(StorageLocator(scheme='s3', raw=self.build_locator(key), bucket=self.bucket, key=key))
         return StoredObject(locator=self.build_locator(key), key=key, size=stat.size, content_type=stat.content_type, etag=stat.etag)
 
+    def copy_object(self, source_key: str, dest_key: str, *, content_type: Optional[str] = None) -> StoredObject:
+        """Server-side copy within the same bucket (no bytes leave the store).
+
+        Used for adopt-in-place ingestion: an object already present in the
+        bucket (e.g. under an inbox/ prefix) is promoted to its final
+        recordings/ key without re-uploading.
+        """
+        client = self._get_client()
+        copy_source = {'Bucket': self.bucket, 'Key': source_key}
+        extra = {}
+        if content_type:
+            # Replacing metadata is required for ContentType to take effect on copy.
+            extra['ContentType'] = content_type
+            extra['MetadataDirective'] = 'REPLACE'
+        client.copy_object(Bucket=self.bucket, Key=dest_key, CopySource=copy_source, **extra)
+        stat = self.stat(StorageLocator(scheme='s3', raw=self.build_locator(dest_key), bucket=self.bucket, key=dest_key))
+        return StoredObject(locator=self.build_locator(dest_key), key=dest_key, size=stat.size, content_type=stat.content_type, etag=stat.etag)
+
+    def delete_key(self, key: str) -> bool:
+        """Delete a raw key in this backend's bucket."""
+        client = self._get_client()
+        client.delete_object(Bucket=self.bucket, Key=key)
+        return True
+
     def exists(self, locator: StorageLocator) -> bool:
         from botocore.exceptions import ClientError
 

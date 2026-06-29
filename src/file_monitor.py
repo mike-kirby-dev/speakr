@@ -309,14 +309,26 @@ class FileMonitor:
         except (OSError, FileNotFoundError):
             return False
             
-    def _process_file(self, processing_path, user_id, tag_id=None):
+    def _process_file(self, processing_path, user_id, tag_id=None, *, source_s3_key=None, original_filename_override=None):
         """
         Process a single locked audio file for a specific user.
 
         Args:
-            processing_path (Path): Path to the locked audio file (e.g., file.mp3.processing)
+            processing_path (Path): Path to the local file to process. For the
+                local monitor this is a ``*.processing`` locked file; for the
+                S3 ingestion watcher it is a plain staging download.
             user_id (int): ID of the user to assign the recording to
             tag_id (int, optional): Tag ID to apply to the recording
+            source_s3_key (str, optional): When the bytes already live in the
+                active S3/R2 backend (adopt-in-place ingestion), the source key
+                under that bucket. If processing does not rewrite the bytes
+                (no conversion/compression), the storage step promotes this key
+                to its final ``recordings/`` key with a server-side copy instead
+                of re-uploading. If conversion *did* happen, the converted
+                output is uploaded normally and the caller cleans up the source.
+            original_filename_override (str, optional): Use this as the original
+                filename instead of deriving it from ``processing_path`` (the S3
+                watcher passes the real object basename here).
         """
         # Import Flask components inside function to avoid circular imports
         from src.app import app, db, Recording, User, transcribe_audio_task
@@ -331,7 +343,11 @@ class FileMonitor:
                     raise ValueError(f"User ID {user_id} not found")
 
                 # Derive original filename by removing .processing suffix
-                original_filename = processing_path.name.replace('.processing', '')
+                # (S3 ingestion passes the real object basename via override).
+                if original_filename_override:
+                    original_filename = original_filename_override
+                else:
+                    original_filename = processing_path.name.replace('.processing', '')
                 safe_filename = secure_filename(original_filename)
                 timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
                 new_filename = f"auto_{timestamp}_{safe_filename}"
@@ -388,6 +404,11 @@ class FileMonitor:
                 # Check if this is a video file (for video retention logic)
                 has_video = codec_info.get('has_video', False) if codec_info else False
 
+                # Track whether the pipeline rewrote the bytes. If it did NOT,
+                # an S3-ingested source can be adopted in place (server-side
+                # copy) instead of re-uploaded.
+                bytes_rewritten = False
+
                 # Video passthrough or retention: skip conversion for videos
                 if (VIDEO_PASSTHROUGH_ASR or VIDEO_RETENTION) and has_video:
                     self.logger.info(f"Video {'passthrough' if VIDEO_PASSTHROUGH_ASR else 'retention'}: keeping original video, skipping conversion")
@@ -405,6 +426,7 @@ class FileMonitor:
                             connector_specs=connector_specs  # Pass connector specs for codec restrictions
                         )
                         final_path = Path(result.output_path)
+                        bytes_rewritten = bool(result.was_converted or result.was_compressed)
 
                         # Log what happened
                         if result.was_converted:
@@ -473,12 +495,29 @@ class FileMonitor:
                 db.session.flush()
 
                 storage_key = storage.build_recording_key(original_filename, recording.id, now=now)
-                stored_object = storage.upload_local_file(
-                    str(final_path),
-                    storage_key,
-                    content_type=mime_type,
-                    delete_source=True,
-                )
+                if source_s3_key and not bytes_rewritten:
+                    # Adopt-in-place: the bytes already live in the S3/R2 backend
+                    # and weren't rewritten, so promote the source key to its final
+                    # recordings/ key with a server-side copy — no re-upload.
+                    stored_object = storage.copy_within_backend(
+                        source_s3_key,
+                        storage_key,
+                        content_type=mime_type,
+                    )
+                    # Drop the local staging download; the source object cleanup
+                    # is the S3 watcher's responsibility (it owns the inbox key).
+                    try:
+                        final_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    self.logger.info(f"Adopted in place (server-side copy) {source_s3_key} -> {storage_key}")
+                else:
+                    stored_object = storage.upload_local_file(
+                        str(final_path),
+                        storage_key,
+                        content_type=mime_type,
+                        delete_source=True,
+                    )
                 recording.audio_path = stored_object.locator
 
                 user_hotwords = (user.transcription_hotwords or '').strip() if getattr(user, 'transcription_hotwords', None) else None

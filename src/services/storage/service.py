@@ -111,6 +111,29 @@ class StorageService:
             return self.s3.upload_local_file(local_path, key, content_type=content_type, delete_source=delete_source)
         return self.local.upload_local_file(local_path, key, content_type=content_type, delete_source=delete_source)
 
+    def copy_within_backend(self, source_key: str, dest_key: str, *, content_type: Optional[str] = None) -> StoredObject:
+        """Server-side copy from source_key to dest_key within the active S3 backend.
+
+        Adopt-in-place ingestion uses this to promote an already-uploaded
+        object (e.g. ingestion staging prefix) to its final recordings/ key
+        without re-uploading bytes. Only valid when the backend is S3.
+        """
+        if self.settings.backend != 's3' or not self.s3:
+            raise RuntimeError('copy_within_backend requires the S3 storage backend')
+        return self.s3.copy_object(source_key, dest_key, content_type=content_type)
+
+    def delete_backend_key(self, key: str, *, missing_ok: bool = True) -> bool:
+        """Delete a raw key in the active S3 backend's bucket (ingestion cleanup)."""
+        if self.settings.backend != 's3' or not self.s3:
+            raise RuntimeError('delete_backend_key requires the S3 storage backend')
+        from botocore.exceptions import ClientError
+        try:
+            return self.s3.delete_key(key)
+        except ClientError:
+            if missing_ok:
+                return False
+            raise
+
     @contextmanager
     def materialize(self, locator_value: str) -> Iterator[MaterializedFile]:
         resolved = self._resolve_backend_for_locator(locator_value)
