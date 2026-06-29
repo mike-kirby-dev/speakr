@@ -76,10 +76,14 @@ Background daemon thread, same lifecycle (`start()`/`stop()`/loop on `check_inte
 2. **Skip already-seen** keys: a key is "new" if not in the processed set. Track processed keys in a small DB table (or reuse the existing `file_hash` duplicate check, which already guards re-ingestion of identical content).
 3. **Claim / lock** (object storage has no atomic rename): server-side **copy** the object to a `processing/<key>` prefix then delete the inbox original (`copy_object` + `delete_object`). The copy succeeding is the claim; if it 404s, another worker already took it. (For a single Speakr instance, an in-process lock + DB seen-set is enough; the copy-to-`processing/` approach makes it safe for multiple workers.)
 4. **Download** to the staging dir (`storage.get_staging_dir()`), preserving the original filename and extension.
-5. **Run the existing pipeline:** call `monitor._process_file(local_staging_path, user_id, tag_id)`. This handles hash/probe/convert, creates the `Recording`, **uploads the final media to the `recordings/` prefix in R2**, and enqueues transcription. `audio_path` ends up an `s3://…` locator → presigned playback works.
-6. **Cleanup:** delete the `processing/<key>` object (its bytes now live under `recordings/`). On failure, leave it in `processing/` (or move to `failed/`) for inspection rather than losing it.
+5. **Run the existing pipeline** for hash/probe/convert and the DB record: call `monitor._process_file(local_staging_path, user_id, tag_id)`, but with the storage step doing **adopt-in-place** rather than a re-upload (see below). It creates the `Recording(processing_source='auto_process', is_inbox=True)` and enqueues transcription; `audio_path` ends up an `s3://…` locator → presigned playback works.
+6. **Cleanup:** delete the `processing/<key>` object once the recording's media lives under `recordings/`. On failure, leave it in `processing/` (or move to `failed/`) for inspection rather than losing it.
 
-**Optimization — adopt in place (avoid re-uploading bytes):** since the file is *already* in R2, when `convert_if_needed()` makes no changes, skip the re-upload: server-side **`copy_object`** from `processing/<key>` to the computed `recordings/<key>` and set `audio_path` directly. Only when conversion produces a new file do we upload the converted output. This is a small branch in/around `_process_file`; ship the simple "download → `_process_file` (re-uploads)" version first, add this later.
+**Adopt in place — no re-upload (the chosen behaviour).** The bytes are *already* in R2, so Speakr must not upload them a second time. After analysis:
+- **No conversion needed** (`convert_if_needed()` is a no-op): server-side **`copy_object`** from `processing/<key>` to the computed `recordings/<key>` and set `audio_path = s3://<bucket>/recordings/<key>` directly. Bytes never leave R2.
+- **Conversion did happen** (codec/size constraints from the active connector produced a new file): upload only the converted output to `recordings/`, then delete the original.
+
+This means `_process_file` needs the storage step parameterised so the S3 watcher can pass an "already-in-R2 source key" and get a server-side copy instead of `storage.upload_local_file()`. The local `file_monitor` keeps its current upload path; only the S3 watcher takes the copy branch. The download in step 4 is still required for `ffprobe`/hashing/conversion analysis, but it is a transient temp file, not a re-upload.
 
 ### Modes & tags
 Reuse the existing `AUTO_PROCESS_MODE` semantics. In R2, "user directories" = key sub-prefixes like `inbox/user<id>/…`; auto-process **tag** folders = `inbox/<tag-folder>/…`, mapped exactly as the local monitor maps sub-directories today.
@@ -128,7 +132,8 @@ S3_PRESIGN_TTL_SECONDS=900                 # UI playback signed-URL TTL
 **Edited:**
 - `src/config/app_config.py` — parse `S3_INGEST_*` / `ENABLE_S3_INGEST`
 - `src/config/startup.py` — `initialize_s3_monitor`
-- *(optional refactor)* `src/file_monitor.py` — extract `_process_file` enough to call it from the S3 watcher (it already takes a local path, so this may be zero-change)
+- `src/file_monitor.py` — parameterise the storage step in `_process_file` so the S3 watcher can supply an "already-in-R2 source key" and get a server-side `copy_object` (adopt-in-place) instead of `storage.upload_local_file()`. The local monitor keeps its existing upload path.
+- *(possibly)* `src/services/storage/service.py` — a thin `copy_within_backend(src_key, dest_key)` helper wrapping S3 `copy_object`, so the watcher doesn't reach into the boto3 client directly.
 
 **No changes needed** to the storage backend, locators, playback/delivery, or the UI.
 
