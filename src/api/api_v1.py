@@ -812,12 +812,22 @@ def list_recordings():
                 pass
 
     # Search filter
+    # Clawd 2026-07-14: widened from title+participants ONLY to also cover the
+    # transcript body, summary, and notes. Previously a search for a term that
+    # was SAID in a meeting but not in its title returned nothing (Jax hit this:
+    # "lead capture / NPS / upsell" were in transcripts but no meeting was titled
+    # that). transcription/summary/notes are columns on Recording — no join,
+    # plain ILIKE substring match, same as before. Widening an OR can only ADD
+    # matches, never remove existing title/participant hits.
     if search_query:
         search_pattern = f'%{search_query}%'
         query = query.filter(
             or_(
                 Recording.title.ilike(search_pattern),
-                Recording.participants.ilike(search_pattern)
+                Recording.participants.ilike(search_pattern),
+                Recording.transcription.ilike(search_pattern),
+                Recording.summary.ilike(search_pattern),
+                Recording.notes.ilike(search_pattern)
             )
         )
 
