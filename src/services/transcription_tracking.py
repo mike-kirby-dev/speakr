@@ -8,7 +8,7 @@ from typing import Tuple, Optional, Dict, List
 
 from sqlalchemy import func, extract
 
-from src.database import db
+from src.database import db, _release_clean_read_txn
 from src.models.transcription_usage import TranscriptionUsage
 from src.models.user import User
 
@@ -168,11 +168,19 @@ class TranscriptionTracker:
         try:
             user = db.session.get(User, user_id)
             if not user or not user.monthly_transcription_budget:
+                _release_clean_read_txn()  # don't hold a read txn across the caller's ASR call
                 return (True, 0, None)  # No budget = unlimited
 
             current_usage = self.get_monthly_usage(user_id)
             budget = user.monthly_transcription_budget
             percentage = (current_usage / budget) * 100
+            # --- SQLite lock-window fix (Clawd 2026-07-07) ---
+            # check_budget() runs right before the multi-minute ASR call in
+            # transcribe_with_connector; without releasing, its read txn stays
+            # open across the whole call and blocks unrelated writes (folder/tag
+            # saves, job-claim) with "database is locked". Release now — all
+            # values we need are already in locals.
+            _release_clean_read_txn()
 
             if percentage >= 100:
                 minutes_used = current_usage // 60

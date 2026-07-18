@@ -36,22 +36,50 @@ class SystemSetting(db.Model):
     def get_setting(key, default_value=None):
         """Get a system setting value by key, with optional default."""
         setting = SystemSetting.query.filter_by(key=key).first()
-        if setting:
+        # --- SQLite lock-window fix (Clawd 2026-07-07) ---
+        # This read triggers SQLAlchemy autobegin on the shared worker session.
+        # get_setting() is called by the summary/title/transcribe tasks right
+        # BEFORE their multi-minute LLM/ASR network calls, and nothing commits
+        # until AFTER the call — so this otherwise-trivial read left a
+        # transaction open for 40-54s (measured via txn trace 2026-07-07),
+        # holding a lock on the SQLite file and blocking unrelated writes
+        # (e.g. a user saving speaker labels -> "database is locked"). This was
+        # THE dominant holder. Materialise the two fields we need into plain
+        # locals FIRST, then rollback to end the read txn (so it can't straddle
+        # the network call). Using locals avoids a lazy-load re-opening the txn
+        # after rollback expires the ORM object.
+        if setting is None:
+            _stype = _sval = None
+            _found = False
+        else:
+            _stype = setting.setting_type
+            _sval = setting.value
+            _found = True
+        # Only release if there are NO pending writes — never discard a caller's
+        # uncommitted changes. A clean read-only autobegin txn is ended with
+        # commit() (write-wise a no-op) which returns the connection to idle so
+        # it can't hold a lock across the following network call.
+        try:
+            if not (db.session.dirty or db.session.new or db.session.deleted):
+                db.session.commit()
+        except Exception:
+            pass
+        if _found:
             # Convert value based on type
-            if setting.setting_type == 'integer':
+            if _stype == 'integer':
                 try:
-                    return int(setting.value) if setting.value is not None else default_value
+                    return int(_sval) if _sval is not None else default_value
                 except (ValueError, TypeError):
                     return default_value
-            elif setting.setting_type == 'boolean':
-                return setting.value.lower() in ('true', '1', 'yes') if setting.value else default_value
-            elif setting.setting_type == 'float':
+            elif _stype == 'boolean':
+                return _sval.lower() in ('true', '1', 'yes') if _sval else default_value
+            elif _stype == 'float':
                 try:
-                    return float(setting.value) if setting.value is not None else default_value
+                    return float(_sval) if _sval is not None else default_value
                 except (ValueError, TypeError):
                     return default_value
             else:  # string
-                return setting.value if setting.value is not None else default_value
+                return _sval if _sval is not None else default_value
         return default_value
 
     @staticmethod

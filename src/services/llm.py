@@ -254,6 +254,22 @@ def call_llm_completion(messages, temperature=0.7, response_format=None, stream=
             f"{budget_key}={completion_args.get(budget_key, 'provider default')}"
         )
 
+        # --- SQLite lock-window fix (Clawd 2026-07-07) ---
+        # The budget check above (token_tracker.check_budget -> db.session.get(User))
+        # opens a SQLAlchemy autobegin transaction on the shared session. Without
+        # this, that transaction stays open across the 46-185s LLM network call
+        # below and only commits when record_usage() runs afterwards — holding a
+        # lock on the whole SQLite file's write path for the entire call. That
+        # blocks unrelated writes (e.g. a user saving speaker labels on a
+        # different, finished recording -> "database is locked"). Committing here
+        # closes the read txn so the network call runs with NO transaction held;
+        # record_usage() below re-opens a fresh, millisecond-long write txn.
+        try:
+            from src.database import db
+            db.session.commit()
+        except Exception as _txn_e:
+            logger.debug(f"pre-LLM session commit no-op/failed: {_txn_e}")
+
         request_started_at = time.monotonic()
         response = client.chat.completions.create(**completion_args)
 

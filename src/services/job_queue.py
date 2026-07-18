@@ -161,6 +161,22 @@ class FairJobQueue:
                 from src.models import ProcessingJob
 
                 try:
+                    # --- SQLite lock-upgrade fix (Clawd 2026-07-14) ---
+                    # This method does a SELECT (deferred read txn) and then an
+                    # UPDATE that upgrades read->write. SQLite does NOT apply
+                    # busy_timeout to a lock UPGRADE — it returns SQLITE_BUSY
+                    # instantly to avoid deadlock — so under a concurrent writer
+                    # (e.g. a user saving a folder/tag while transcribe+summary
+                    # run) the claim errored with "database is locked" and gave
+                    # up the tick, spamming an ERROR stack trace. Fix: take the
+                    # write lock UP FRONT with BEGIN IMMEDIATE so busy_timeout
+                    # (60s, set in database.py) actually applies and we WAIT for
+                    # the writer instead of erroring. Roll back any stale
+                    # autobegin txn first so BEGIN IMMEDIATE starts clean.
+                    from sqlalchemy import text as _sql_text
+                    db.session.rollback()
+                    db.session.execute(_sql_text("BEGIN IMMEDIATE"))
+
                     # Get list of users with queued jobs of our types
                     users_with_jobs = db.session.query(
                         ProcessingJob.user_id
@@ -174,6 +190,8 @@ class FairJobQueue:
                     ).all()
 
                     if not users_with_jobs:
+                        # Release the BEGIN IMMEDIATE write lock — no job to claim.
+                        db.session.rollback()
                         return None
 
                     user_ids = [u[0] for u in users_with_jobs]
@@ -241,10 +259,21 @@ class FairJobQueue:
                         logger.info(f"[{queue_name.upper()}] Claimed job {candidate_job.id} (type={candidate_job.job_type}) for user {candidate_job.user_id}, recording {candidate_job.recording_id} (waited {wait_time:.1f}s)")
                         return candidate_job
 
+                    # No candidate job for the chosen user — release the lock.
+                    db.session.rollback()
                     return None
 
                 except Exception as e:
-                    logger.error(f"Error claiming {queue_name} job: {e}", exc_info=True)
+                    # A "database is locked" here means BEGIN IMMEDIATE still
+                    # couldn't get the write lock within busy_timeout (60s) —
+                    # rare, and self-healing: just skip this tick and the poll
+                    # loop retries. Log at DEBUG (not ERROR) so it doesn't spam
+                    # an alarming stack trace for a transient, recovered-from
+                    # condition. Any OTHER exception is a real error → keep ERROR.
+                    if 'database is locked' in str(e).lower():
+                        logger.debug(f"[{queue_name.upper()}] claim deferred — DB busy past timeout, retrying next poll")
+                    else:
+                        logger.error(f"Error claiming {queue_name} job: {e}", exc_info=True)
                     db.session.rollback()
                     return None
 
@@ -325,6 +354,20 @@ class FairJobQueue:
                 recording = db.session.get(Recording, recording_id)
                 if not recording:
                     raise ValueError(f"Recording {recording_id} not found")
+
+                # --- SQLite lock-window fix (Clawd 2026-07-07) ---
+                # The two get()s above open a SQLAlchemy autobegin transaction on
+                # this worker thread's connection. Dispatch below runs the ENTIRE
+                # multi-minute job (transcribe/summary/embeddings). Without
+                # releasing here, that connection's transaction is held open for
+                # the whole job (measured 157-219s via txn trace), and with the
+                # transcription + summary queues running as separate threads they
+                # then contend on SQLite's single-writer lock — blocking each
+                # other AND unrelated user writes (folder/tag/speaker saves) with
+                # "database is locked". Commit now so the outer read txn can't
+                # straddle the job; the inner task functions manage their own
+                # short write transactions.
+                db.session.commit()
 
                 # Webhook fan-out for "started" events (#275) is now
                 # emitted INSIDE each job handler after the
@@ -640,15 +683,50 @@ class FairJobQueue:
                 ProcessingJob.status == 'processing'
             ).all()
 
+            recovered = 0
             for job in orphaned:
-                job.status = 'queued'
-                job.started_at = None
                 queue_name = 'summary' if job.job_type in SUMMARY_JOBS else 'transcription'
-                logger.info(f"Recovered orphaned {queue_name} job {job.id} for recording {job.recording_id}")
+                # clawd 2026-07-11: cap orphan-recovery. A job that wedges BEFORE
+                # its first real progress write (e.g. a slow S3/R2 download or
+                # video audio-extraction holding the SQLite writer) never fails
+                # normally — it just gets orphan-recovered on every restart and
+                # re-wedges, holding the lock forever and blocking unrelated
+                # writes (speaker-saves). Count each recovery against retry_count
+                # and mark the job FAILED once it has burned MAX_RETRIES
+                # recoveries, so an immortal lock-hog can't survive N restarts.
+                job.retry_count = (job.retry_count or 0) + 1
+                if job.retry_count > MAX_RETRIES:
+                    job.status = 'failed'
+                    job.started_at = None
+                    job.error_message = (
+                        f"Marked failed after {job.retry_count - 1} orphan-recoveries "
+                        f"without completing (repeatedly wedged during startup/setup)."
+                    )
+                    # Surface the failure on the recording too, so it isn't stuck 'PROCESSING'.
+                    try:
+                        from src.models import Recording
+                        rec = Recording.query.get(job.recording_id)
+                        if rec and rec.status == 'PROCESSING':
+                            rec.status = 'FAILED'
+                    except Exception:
+                        pass
+                    logger.error(
+                        f"Orphaned {queue_name} job {job.id} (recording {job.recording_id}) "
+                        f"exceeded {MAX_RETRIES} recoveries — marking FAILED instead of reviving"
+                    )
+                else:
+                    job.status = 'queued'
+                    job.started_at = None
+                    recovered += 1
+                    logger.info(
+                        f"Recovered orphaned {queue_name} job {job.id} for recording "
+                        f"{job.recording_id} (recovery {job.retry_count}/{MAX_RETRIES})"
+                    )
 
             if orphaned:
                 db.session.commit()
-                logger.info(f"Recovered {len(orphaned)} orphaned jobs")
+                logger.info(f"Recovered {recovered} orphaned job(s); "
+                            f"{len(orphaned) - recovered} marked failed (recovery cap)")
 
     def get_queue_status(self) -> Dict[str, Any]:
         """Get the current queue status for both queues."""

@@ -561,18 +561,36 @@ def generate_summary_only_task(app_context, recording_id, custom_prompt_override
         language_directive = f"IMPORTANT: You MUST provide the summary in {user_output_language}. The entire response must be in {user_output_language}." if user_output_language else ""
 
         # Determine which summarization instructions to use.
-        # Priority order: custom_prompt_override > tag custom prompt > folder custom prompt > user summary prompt > admin default prompt > hardcoded fallback.
-        # When custom_prompt_append is True the override is appended to the resolved default rather than replacing it.
+        #
+        # LAYERED INHERITANCE (Clawd 2026-07-18, Mike's request — mirrors how a
+        # CLAUDE.md in a subdirectory layers on top of the root one):
+        #   folder prompt (base / "directory" layer)
+        #     + tag prompt(s) (the meeting-type layer, appended)
+        # stack together into the resolved default. Previously folder and tag
+        # were mutually exclusive (tag won, folder was ignored). Now a recording
+        # filed under a business FOLDER and marked with a type TAG gets BOTH:
+        # the business lens as the base, the meeting-type structure on top.
+        #
+        # Priority / composition order:
+        #   custom_prompt_override (replace mode) > [folder + tag stacked]
+        #     > folder-only > tag-only > user summary prompt > admin default
+        #     > hardcoded fallback.
+        # When custom_prompt_append is True the override is appended to whatever
+        # the above resolves to rather than replacing it.
         summarization_instructions = ""
         if custom_prompt_override and not custom_prompt_append:
             current_app.logger.info(f"Using custom prompt override for recording {recording_id} (length: {len(custom_prompt_override)})")
             summarization_instructions = custom_prompt_override
-        elif tag_custom_prompt:
-            current_app.logger.info(f"Using tag custom prompt for recording {recording_id}")
-            summarization_instructions = tag_custom_prompt
+        elif folder_custom_prompt and tag_custom_prompt:
+            # Both present → stack: folder base, then tag layer.
+            summarization_instructions = f"{folder_custom_prompt}\n\n{tag_custom_prompt}"
+            current_app.logger.info(f"Stacking folder + tag custom prompts for recording {recording_id} (folder base + tag layer)")
         elif folder_custom_prompt:
             current_app.logger.info(f"Using folder custom prompt for recording {recording_id}")
             summarization_instructions = folder_custom_prompt
+        elif tag_custom_prompt:
+            current_app.logger.info(f"Using tag custom prompt for recording {recording_id}")
+            summarization_instructions = tag_custom_prompt
         elif user_summary_prompt:
             current_app.logger.info(f"Using user custom prompt for recording {recording_id}")
             summarization_instructions = user_summary_prompt
@@ -688,6 +706,18 @@ Summarization Instructions:
         current_app.logger.debug(f"=== END SUMMARIZATION DEBUG for recording {recording_id} ===")
 
         try:
+            # --- SQLite lock-window fix (Clawd 2026-07-07) ---
+            # The summary LLM call takes 46-185s. SQLAlchemy's autobegin holds a
+            # transaction open from the reads above (prompt resolution, tag/user
+            # lookups, lazy-loads) straight through this network call until the
+            # commit below — locking the whole SQLite file's write path for
+            # minutes and blocking unrelated writes (e.g. a user saving speaker
+            # labels on a DIFFERENT, finished recording -> "database is locked").
+            # Fix: snapshot the one attr we need, then COMMIT to close the open
+            # read txn so the LLM call runs with NO transaction held. The write
+            # below re-opens a fresh, millisecond-long txn.
+            _summ_user_id = recording.user_id
+            db.session.commit()
             completion = call_llm_completion(
                 messages=[
                     {"role": "system", "content": system_message_content},
@@ -695,7 +725,7 @@ Summarization Instructions:
                 ],
                 temperature=0.5,
                 max_tokens=int(os.environ.get("SUMMARY_MAX_TOKENS", "3000")),
-                user_id=recording.user_id,
+                user_id=_summ_user_id,
                 operation_type='summarization'
             )
 
@@ -1256,13 +1286,20 @@ def merge_diarized_chunks(chunk_results):
         chunk_results: List of chunk results with 'transcription', 'segments', 'start_time'
 
     Returns:
-        Tuple of (merged_text, merged_segments, all_speakers)
+        Tuple of (merged_text, merged_segments, all_speakers, merged_embeddings)
+        where merged_embeddings is {global_speaker_label: embedding} for the
+        speakers that carried a voice embedding — the auto-speaker-labeller
+        (apply_auto_speaker_labels) reads recording.speaker_embeddings, which is
+        populated from this. clawd 2026-07-09: the 2026-06-28 patch built this
+        registry internally to match speakers across chunks but never returned
+        it, so recording.speaker_embeddings was always empty on the chunked path
+        (every real/long recording) and auto-tagging never fired. Now returned.
     """
     from src.services.transcription import TranscriptionSegment
     import re
 
     if not chunk_results:
-        return "", [], []
+        return "", [], [], {}
 
     # Sort chunks by start time to ensure correct order
     sorted_chunks = sorted(chunk_results, key=lambda x: x.get('start_time', 0))
@@ -1272,8 +1309,44 @@ def merge_diarized_chunks(chunk_results):
     all_speakers = set()
     next_speaker_number = 0  # Track the next available speaker number
 
+    # clawd 2026-06-28: cross-chunk speaker matching by voice embedding.
+    # Diarization restarts speaker numbering per chunk (every chunk has its own
+    # SPEAKER_00), so the old code force-remapped each chunk's speakers to fresh
+    # unique IDs — turning one person into N labels across N chunks. WhisperX
+    # returns a voice embedding per speaker per chunk (ASR_RETURN_SPEAKER_EMBEDDINGS),
+    # so instead we keep a registry of {global_label: representative_embedding} and
+    # resolve each chunk-local speaker to an EXISTING global label when its voice
+    # matches (cosine >= threshold); only mint a new label on no-match. Falls back
+    # to the old unique-renumber behaviour when embeddings are absent.
+    try:
+        from src.services.speaker_embedding_matcher import calculate_similarity
+    except Exception:
+        calculate_similarity = None
+    # Match threshold: same default the rest of Speakr's matcher uses (0.70).
+    # Tunable via env without a rebuild.
+    try:
+        _match_threshold = float(os.environ.get('CHUNK_SPEAKER_MATCH_THRESHOLD', '0.70'))
+    except (TypeError, ValueError):
+        _match_threshold = 0.70
+    speaker_registry = {}  # global_label -> embedding (list[float])
+
+    def _resolve_global_label(emb):
+        """Return an existing global label whose voice matches emb, or None."""
+        if not emb or calculate_similarity is None:
+            return None
+        best_label, best_sim = None, 0.0
+        for label, ref_emb in speaker_registry.items():
+            try:
+                sim = calculate_similarity(emb, ref_emb)
+            except Exception:
+                continue
+            if sim >= _match_threshold and sim > best_sim:
+                best_label, best_sim = label, sim
+        return best_label
+
     for chunk_idx, chunk in enumerate(sorted_chunks):
         chunk_segments = chunk.get('segments') or []
+        chunk_embeddings = chunk.get('speaker_embeddings') or {}
 
         # Build speaker remapping for this chunk
         # Maps original speaker label -> new unique speaker label
@@ -1294,21 +1367,32 @@ def merge_diarized_chunks(chunk_results):
         # Create remapping: sort speakers to ensure deterministic ordering
         speaker_remap = {}
         for original_speaker in sorted(chunk_speakers):
-            if original_speaker and original_speaker != 'Unknown':
-                # Extract number from speaker label (e.g., SPEAKER_00 -> 0)
-                # For first chunk, keep original numbering; for subsequent chunks, remap
-                if chunk_idx == 0:
-                    # First chunk: keep original labels but track highest number
-                    speaker_remap[original_speaker] = original_speaker
-                    match = re.search(r'(\d+)$', original_speaker)
-                    if match:
-                        num = int(match.group(1))
-                        next_speaker_number = max(next_speaker_number, num + 1)
-                else:
-                    # Subsequent chunks: remap to new unique numbers
-                    new_speaker = f"SPEAKER_{next_speaker_number:02d}"
-                    speaker_remap[original_speaker] = new_speaker
-                    next_speaker_number += 1
+            if not original_speaker or original_speaker == 'Unknown':
+                continue
+            emb = chunk_embeddings.get(original_speaker)
+
+            # Try to match this voice to a speaker already seen in a prior chunk.
+            matched = _resolve_global_label(emb)
+            if matched is not None:
+                # Same person as an earlier chunk — reuse their global label.
+                speaker_remap[original_speaker] = matched
+                continue
+
+            # New voice (or no embedding to match on) — allocate a global label.
+            if chunk_idx == 0:
+                # First chunk: keep original numbering, track the high-water mark.
+                global_label = original_speaker
+                match = re.search(r'(\d+)$', original_speaker)
+                if match:
+                    next_speaker_number = max(next_speaker_number, int(match.group(1)) + 1)
+            else:
+                global_label = f"SPEAKER_{next_speaker_number:02d}"
+                next_speaker_number += 1
+
+            speaker_remap[original_speaker] = global_label
+            # Register this voice so later chunks can match against it.
+            if emb:
+                speaker_registry[global_label] = emb
 
         # Update transcription text with remapped speakers
         chunk_text = chunk.get('transcription', '').strip()
@@ -1367,7 +1451,14 @@ def merge_diarized_chunks(chunk_results):
             ))
 
     merged_text = '\n'.join(merged_parts)
-    return merged_text, merged_segments, sorted(list(all_speakers))
+    # clawd 2026-07-09: return the voice-embedding registry so the caller can set
+    # recording.speaker_embeddings and the auto-labeller can run. Restrict to the
+    # speakers that actually survived into the merged transcript.
+    merged_embeddings = {
+        label: emb for label, emb in speaker_registry.items()
+        if label in all_speakers
+    }
+    return merged_text, merged_segments, sorted(list(all_speakers)), merged_embeddings
 
 
 def transcribe_chunks_with_connector(connector, filepath, filename, mime_type, language, diarize=False, hotwords=None, initial_prompt=None, transcription_model=None):
@@ -1467,6 +1558,13 @@ def transcribe_chunks_with_connector(connector, filepath, filename, mime_type, l
                                     model=transcription_model,
                                 )
 
+                            # --- SQLite lock-window fix (Clawd 2026-07-11, chunked path) ---
+                            # Same fix as the non-chunked path (~2016): commit any pending
+                            # writes so the multi-MINUTE WhisperX ASR round-trip holds NO
+                            # SQLite write txn. Without this, EACH chunk of a long recording
+                            # pins the single writer across its ASR call -> unrelated saves
+                            # (speaker labels on a finished recording) get 'database is locked'.
+                            db.session.commit()
                             response = connector.transcribe(request)
 
                         # For the first diarized chunk, extract speaker samples for subsequent chunks
@@ -1505,7 +1603,11 @@ def transcribe_chunks_with_connector(connector, filepath, filename, mime_type, l
                             'transcription': response.text,
                             'filename': chunk['filename'],
                             'segments': response.segments if use_diarization else None,
-                            'speakers': response.speakers if use_diarization else None
+                            'speakers': response.speakers if use_diarization else None,
+                            # clawd 2026-06-28: carry per-chunk voice embeddings through to
+                            # the merge so it can match the same speaker across chunks instead
+                            # of blind-renumbering. {speaker_label: [256 floats]} or None.
+                            'speaker_embeddings': response.speaker_embeddings if use_diarization else None
                         }
                         chunk_results.append(chunk_result)
                         current_app.logger.info(f"Chunk {i+1} transcribed successfully: {len(response.text)} characters")
@@ -1539,7 +1641,7 @@ def transcribe_chunks_with_connector(connector, filepath, filename, mime_type, l
 
             if use_diarization:
                 # For diarized chunks, merge text AND segments with adjusted timestamps
-                merged_text, merged_segments, all_speakers = merge_diarized_chunks(chunk_results)
+                merged_text, merged_segments, all_speakers, merged_embeddings = merge_diarized_chunks(chunk_results)
 
                 if not merged_text.strip():
                     raise ChunkProcessingError("Merged transcription is empty")
@@ -1548,6 +1650,10 @@ def transcribe_chunks_with_connector(connector, filepath, filename, mime_type, l
                 chunking_service.log_processing_statistics(chunk_results)
 
                 current_app.logger.info(f"Merged diarization: {len(merged_segments)} segments, {len(all_speakers)} speakers: {all_speakers}")
+                # clawd 2026-07-09: carry the merged voice embeddings through so
+                # recording.speaker_embeddings gets populated (processing.py ~1999)
+                # and auto-speaker-labelling can run on chunked (i.e. all long) recordings.
+                current_app.logger.info(f"Merged speaker embeddings for: {list(merged_embeddings.keys())}")
 
                 # Return a TranscriptionResponse so segments are preserved
                 from src.services.transcription import TranscriptionResponse
@@ -1555,6 +1661,7 @@ def transcribe_chunks_with_connector(connector, filepath, filename, mime_type, l
                     text=merged_text,
                     segments=merged_segments,
                     speakers=all_speakers,
+                    speaker_embeddings=merged_embeddings or None,
                     provider=connector.PROVIDER_NAME,
                     model=getattr(connector, 'model', 'unknown')
                 )
@@ -1693,6 +1800,16 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                     # Video retention: keep original video, extract audio to temp for transcription only
                     current_app.logger.info(f"Video container detected, retaining video and extracting audio to temp...")
                     try:
+                        # --- SQLite lock-window fix (Clawd 2026-07-14) ---
+                        # Release any clean read-txn before the multi-second ffmpeg audio
+                        # extraction so we don't hold the SQLite writer across it (same class
+                        # as the connector.transcribe() fix at ~L2022). Only commit when there
+                        # are no pending writes, so nothing uncommitted is discarded.
+                        try:
+                            if not (db.session.dirty or db.session.new or db.session.deleted):
+                                db.session.commit()
+                        except Exception:
+                            pass
                         audio_filepath, audio_mime_type = extract_audio_from_video(filepath, cleanup_original=False)
                         # Use extracted audio for transcription processing
                         actual_filepath = audio_filepath
@@ -1727,6 +1844,16 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                     # objects and normalizing cached durations, this branch should be removable.
                     current_app.logger.info(f"Video container detected, extracting audio...")
                     try:
+                        # --- SQLite lock-window fix (Clawd 2026-07-14) ---
+                        # Release any clean read-txn before the multi-second ffmpeg audio
+                        # extraction so we don't hold the SQLite writer across it (same class
+                        # as the connector.transcribe() fix at ~L2022). Only commit when there
+                        # are no pending writes, so nothing uncommitted is discarded.
+                        try:
+                            if not (db.session.dirty or db.session.new or db.session.deleted):
+                                db.session.commit()
+                        except Exception:
+                            pass
                         audio_filepath, audio_mime_type = extract_audio_from_video(filepath)
                         actual_filepath = audio_filepath
                         actual_content_type = audio_mime_type
@@ -1859,6 +1986,14 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
             max_attempts = 2
             last_error = None
 
+            # --- SQLite lock-window fix (Clawd 2026-07-07) ---
+            # Close any open autobegin txn from the setup reads above BEFORE the
+            # transcription loop, so neither the chunked nor non-chunked ASR call
+            # (each a multi-minute WhisperX round-trip) holds a write lock on the
+            # SQLite file during the call. Covers both branches; the per-branch
+            # recording.transcription writes below re-open fresh short txns.
+            db.session.commit()
+
             for attempt in range(max_attempts):
                 try:
                     if should_chunk:
@@ -1878,6 +2013,18 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                             # Diarized response - store with segments for click-to-seek and speaker identification
                             recording.transcription = chunk_result.to_storage_format()
                             current_app.logger.info(f"Chunked diarized transcription completed: {len(chunk_result.text)} characters, {len(chunk_result.segments)} segments")
+                            # clawd 2026-07-10: store merged voice embeddings on the CHUNKED path too.
+                            # BUG: the embedding-store block below (`recording.speaker_embeddings = response...`)
+                            # lived ONLY in the non-chunked `else` branch, keyed off `response`. On the chunked
+                            # path the result is `chunk_result` (from transcribe_chunks_with_connector, which now
+                            # returns merged embeddings via the 2026-07-09 fix) and its embeddings were never
+                            # persisted -> recording.speaker_embeddings stayed empty on every long recording,
+                            # so auto-speaker-labelling never fired. This is the second half of that fix.
+                            if getattr(chunk_result, 'speaker_embeddings', None):
+                                recording.speaker_embeddings = chunk_result.speaker_embeddings
+                                current_app.logger.info(f"Stored speaker embeddings (chunked) for speakers: {list(chunk_result.speaker_embeddings.keys())}")
+                            else:
+                                current_app.logger.info("Chunked diarized result carried no speaker embeddings to store")
                         else:
                             # Plain text response
                             transcription_text = chunk_result.text if hasattr(chunk_result, 'text') else chunk_result
@@ -1900,6 +2047,17 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                             )
 
                             current_app.logger.info(f"Transcribing with connector: diarize={should_diarize}, language={language}")
+                            # --- SQLite lock-window fix (Clawd 2026-07-07) ---
+                            # The connector.transcribe() call below is the multi-MINUTE
+                            # WhisperX ASR round-trip to the GPU box. SQLAlchemy autobegin
+                            # holds a transaction open (from the commits/reads above)
+                            # straight through it, locking the whole SQLite file's write
+                            # path for the entire transcription. THIS is the dominant
+                            # blocker of unrelated writes (a user saving speaker labels on
+                            # a finished recording -> "database is locked"), not the
+                            # summary path. Commit here so the ASR call holds NO txn; the
+                            # recording.transcription write below re-opens a fresh one.
+                            db.session.commit()
                             response = connector.transcribe(request)
 
                         # Store the result
@@ -2273,6 +2431,16 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
             else:
                 current_app.logger.info(f"[Incognito] Video detected, extracting audio...")
                 try:
+                    # --- SQLite lock-window fix (Clawd 2026-07-14) ---
+                    # Release any clean read-txn before the multi-second ffmpeg audio
+                    # extraction so we don't hold the SQLite writer across it (same class
+                    # as the connector.transcribe() fix at ~L2022). Only commit when there
+                    # are no pending writes, so nothing uncommitted is discarded.
+                    try:
+                        if not (db.session.dirty or db.session.new or db.session.deleted):
+                            db.session.commit()
+                    except Exception:
+                        pass
                     audio_filepath, audio_mime_type = extract_audio_from_video(filepath, cleanup_original=False)
                     actual_filepath = audio_filepath
                     actual_content_type = audio_mime_type
@@ -2361,6 +2529,13 @@ def transcribe_incognito(filepath, original_filename, language=None, min_speaker
                     max_speakers=max_speakers
                 )
 
+                # --- SQLite lock-window fix (Clawd 2026-07-11, chunked path) ---
+                # Same fix as the non-chunked path (~2016): commit any pending
+                # writes so the multi-MINUTE WhisperX ASR round-trip holds NO
+                # SQLite write txn. Without this, EACH chunk of a long recording
+                # pins the single writer across its ASR call -> unrelated saves
+                # (speaker labels on a finished recording) get 'database is locked'.
+                db.session.commit()
                 response = connector.transcribe(request)
 
             if response.segments and response.has_diarization():

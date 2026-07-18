@@ -8,7 +8,7 @@ from typing import Tuple, Optional, Dict, List
 
 from sqlalchemy import func, extract
 
-from src.database import db
+from src.database import db, _release_clean_read_txn
 from src.models.token_usage import TokenUsage
 from src.models.user import User
 
@@ -147,11 +147,16 @@ class TokenTracker:
         try:
             user = db.session.get(User, user_id)
             if not user or not user.monthly_token_budget:
+                _release_clean_read_txn()  # don't hold a read txn across the caller's LLM call
                 return (True, 0, None)  # No budget = unlimited
 
             current_usage = self.get_monthly_usage(user_id)
             budget = user.monthly_token_budget
             percentage = (current_usage / budget) * 100
+            # --- SQLite lock-window fix (Clawd 2026-07-07) ---
+            # Release the read txn before the caller's multi-minute LLM call so
+            # it can't block unrelated writes ("database is locked").
+            _release_clean_read_txn()
 
             if percentage >= 100:
                 return (False, percentage,
