@@ -1,0 +1,7 @@
+# Git-sourced code layer. Base image (speakr-mk:lite) supplies the OS, ffmpeg,
+# python deps and offline models — none of which ever drifted. This COPY replaces
+# the ENTIRE /app/src with the reconciled git checkout (branch
+# clawd/consolidate-hotpatches-20260718), so 100% of the application code is now
+# traceable to a repo commit, not to stacked throwaway Dockerfiles.
+FROM speakr-mk:lite
+COPY src/ /app/src/
