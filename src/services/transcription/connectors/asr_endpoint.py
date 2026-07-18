@@ -190,29 +190,65 @@ class ASREndpointConnector(BaseTranscriptionConnector):
 
             logger.info(f"Sending ASR request to {url} with params: {params} (timeout: {self.timeout}s)")
 
-            with httpx.Client() as client:
-                response = client.post(url, params=params, files=files, timeout=timeout)
-                logger.info(f"ASR request completed with status: {response.status_code}")
-                response.raise_for_status()
+            # --- Hung-socket self-heal fix (Clawd 2026-07-08) ---
+            # httpx's read/write timeouts are INACTIVITY-based (per-chunk), NOT a
+            # wall-clock deadline (confirmed: httpx has no total-request timeout).
+            # When the ASR socket half-closes (peer hangs up, no bytes flow), httpx
+            # isn't actively reading, so the read timeout never fires and the
+            # request hangs FOREVER — freezing the single transcribe worker and the
+            # whole queue behind it (observed: a job stuck ~6h on a CLOSE_WAIT
+            # socket, 2026-07-07). Enforce a real WALL-CLOCK ceiling by running the
+            # POST in a worker thread and abandoning it after a hard deadline; the
+            # existing `except httpx.TimeoutException` handler below then fails/
+            # retries the job cleanly. Deadline = self.timeout + 300s slack so a
+            # genuine long transcription is never tripped. Self-heals at the source.
+            import concurrent.futures as _futures
 
-                # Parse the JSON response
-                response_text = response.text
-                try:
-                    data = response.json()
-                except Exception as json_err:
-                    if response_text.strip().startswith('<'):
-                        logger.error(f"ASR returned HTML error page (status {response.status_code})")
-                        raise ProviderError(
-                            f"ASR service returned HTML error page",
-                            provider=self.PROVIDER_NAME,
-                            status_code=response.status_code
-                        )
-                    else:
-                        raise ProviderError(
-                            f"ASR service returned invalid response: {json_err}",
-                            provider=self.PROVIDER_NAME,
-                            status_code=response.status_code
-                        )
+            def _do_post():
+                with httpx.Client() as client:
+                    return client.post(url, params=params, files=files, timeout=timeout)
+
+            _hard_deadline = float(self.timeout) + 300.0
+            # NOTE: do NOT use `with ThreadPoolExecutor(...)` here — its __exit__
+            # calls shutdown(wait=True), which would block on the abandoned hung
+            # thread and re-freeze us. Create it, and on timeout shutdown(wait=
+            # False) so the daemonic worker is left to die when the process exits.
+            _ex = _futures.ThreadPoolExecutor(max_workers=1)
+            _fut = _ex.submit(_do_post)
+            try:
+                response = _fut.result(timeout=_hard_deadline)
+            except _futures.TimeoutError:
+                _ex.shutdown(wait=False)
+                logger.error(
+                    f"ASR request to {url} exceeded hard wall-clock deadline "
+                    f"of {_hard_deadline:.0f}s (likely a hung/half-closed socket) "
+                    f"— abandoning so the job can fail/retry instead of freezing."
+                )
+                raise httpx.TimeoutException(
+                    f"ASR request exceeded hard deadline of {_hard_deadline:.0f}s"
+                )
+            _ex.shutdown(wait=False)
+            logger.info(f"ASR request completed with status: {response.status_code}")
+            response.raise_for_status()
+
+            # Parse the JSON response
+            response_text = response.text
+            try:
+                data = response.json()
+            except Exception as json_err:
+                if response_text.strip().startswith('<'):
+                    logger.error(f"ASR returned HTML error page (status {response.status_code})")
+                    raise ProviderError(
+                        f"ASR service returned HTML error page",
+                        provider=self.PROVIDER_NAME,
+                        status_code=response.status_code
+                    )
+                else:
+                    raise ProviderError(
+                        f"ASR service returned invalid response: {json_err}",
+                        provider=self.PROVIDER_NAME,
+                        status_code=response.status_code
+                    )
 
             return self._parse_response(data)
 
