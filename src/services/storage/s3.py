@@ -104,6 +104,30 @@ class S3StorageBackend:
         stat = self.stat(StorageLocator(scheme='s3', raw=self.build_locator(key), bucket=self.bucket, key=key))
         return StoredObject(locator=self.build_locator(key), key=key, size=stat.size, content_type=stat.content_type, etag=stat.etag)
 
+    def copy_object(self, source_key: str, dest_key: str, *, content_type: Optional[str] = None) -> StoredObject:
+        """Server-side copy within the same bucket (no bytes leave the store).
+
+        Used for adopt-in-place ingestion: an object already present in the
+        bucket (e.g. under an inbox/ prefix) is promoted to its final
+        recordings/ key without re-uploading.
+        """
+        client = self._get_client()
+        copy_source = {'Bucket': self.bucket, 'Key': source_key}
+        extra = {}
+        if content_type:
+            # Replacing metadata is required for ContentType to take effect on copy.
+            extra['ContentType'] = content_type
+            extra['MetadataDirective'] = 'REPLACE'
+        client.copy_object(Bucket=self.bucket, Key=dest_key, CopySource=copy_source, **extra)
+        stat = self.stat(StorageLocator(scheme='s3', raw=self.build_locator(dest_key), bucket=self.bucket, key=dest_key))
+        return StoredObject(locator=self.build_locator(dest_key), key=dest_key, size=stat.size, content_type=stat.content_type, etag=stat.etag)
+
+    def delete_key(self, key: str) -> bool:
+        """Delete a raw key in this backend's bucket."""
+        client = self._get_client()
+        client.delete_object(Bucket=self.bucket, Key=key)
+        return True
+
     def exists(self, locator: StorageLocator) -> bool:
         from botocore.exceptions import ClientError
 
@@ -141,7 +165,19 @@ class S3StorageBackend:
         suffix = Path(key).suffix
         fd, tmp_path = tempfile.mkstemp(prefix='speakr_s3_', suffix=suffix)
         os.close(fd)
-        client.download_file(bucket, key, tmp_path)
+        # clawd 2026-07-11: force a single-stream download instead of boto3's
+        # default managed multipart transfer. Against Cloudflare R2, boto3's
+        # parallel range-GET multipart stalls partway on large objects (rec 35,
+        # a 104MB Zoom audio, froze at ~40MB every time and never transcribed —
+        # a plain single-stream get_object read the same object in 1.6s). A high
+        # multipart_threshold + single concurrency keeps it one sequential GET.
+        from boto3.s3.transfer import TransferConfig
+        single_stream = TransferConfig(
+            multipart_threshold=8 * 1024 * 1024 * 1024,  # 8 GiB: effectively never multipart
+            max_concurrency=1,
+            use_threads=False,
+        )
+        client.download_file(bucket, key, tmp_path, Config=single_stream)
         return MaterializedFile(local_path=tmp_path, cleanup_required=True)
 
     def presign_get_url(self, locator: StorageLocator, expires_seconds: int, response_content_type: Optional[str] = None,
