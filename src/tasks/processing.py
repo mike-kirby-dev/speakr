@@ -173,11 +173,24 @@ def format_transcription_for_llm(transcription_text):
         transcription_data = json.loads(transcription_text)
         if isinstance(transcription_data, list):
             # It's our simplified JSON format
+            def _fmt_ts(seconds):
+                # start_time is seconds (float). Render [HH:MM:SS] so summary prompts
+                # can cite a jump-to timestamp for clipping. Missing/invalid -> "".
+                try:
+                    s = int(float(seconds))
+                except (TypeError, ValueError):
+                    return ""
+                if s < 0:
+                    return ""
+                h, rem = divmod(s, 3600)
+                m, sec = divmod(rem, 60)
+                return f"[{h:02d}:{m:02d}:{sec:02d}] "
             formatted_lines = []
             for segment in transcription_data:
                 speaker = segment.get('speaker', 'Unknown Speaker')
                 sentence = segment.get('sentence', '')
-                formatted_lines.append(f"[{speaker}]: {sentence}")
+                ts = _fmt_ts(segment.get('start_time'))
+                formatted_lines.append(f"{ts}[{speaker}]: {sentence}")
             return "\n".join(formatted_lines)
     except (json.JSONDecodeError, TypeError):
         # Not a JSON, or not the format we expect, so return as is.
