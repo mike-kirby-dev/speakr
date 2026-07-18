@@ -15,6 +15,24 @@ from datetime import datetime, timedelta
 from src.services.job_queue import job_queue
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, send_file, Response, current_app, make_response
 from flask_login import login_required, current_user
+
+
+def _commit_with_retry(db_session, attempts=8, base_delay=0.4):
+    """Commit, retrying on transient SQLite 'database is locked' contention.
+    Lets a write (e.g. speaker-name update) wait out a concurrent transcribe/summary
+    writer instead of 500ing. WAL = one writer at a time; this just queues politely."""
+    import time
+    from sqlalchemy.exc import OperationalError
+    for i in range(attempts):
+        try:
+            db_session.commit()
+            return
+        except OperationalError as e:
+            if "database is locked" in str(e).lower() and i < attempts - 1:
+                db_session.rollback()
+                time.sleep(base_delay * (i + 1))
+                continue
+            raise
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 from sqlalchemy import select
@@ -725,6 +743,11 @@ def generate_summary_endpoint(recording_id):
 def update_speakers(recording_id):
     """Updates speaker labels in a transcription with provided names."""
     try:
+        # clawd 2026-06-26: disable autoflush so read queries (Speaker.query) during the
+        # embedding/snippet block don't prematurely flush pending writes and grab the SQLite
+        # write lock mid-request (the 'Query-invoked autoflush ... database is locked' error).
+        # _commit_with_retry() does the single deliberate flush+commit at the end.
+        db.session.autoflush = False  # clawd: speaker-save lock fix
         recording = db.session.get(Recording, recording_id)
         if not recording:
             return jsonify({'error': 'Recording not found'}), 404
@@ -858,12 +881,37 @@ def update_speakers(recording_id):
                 current_app.logger.error(f"Error updating speaker embeddings: {e}", exc_info=True)
                 # Don't fail the whole request if embedding update fails
 
-        db.session.commit()
+        # clawd 2026-07-11: prune ghost speakers with no transcript items.
+        # When a real person is diarized as 2+ labels, Mike reassigns transcript
+        # segments to the correct speaker, leaving the source label with zero
+        # segments. That emptied label lingers in recording.speaker_embeddings
+        # (and thus the UI speaker list) even though it names nobody in the
+        # transcript. After every speaker-tagging submission, drop any embedding
+        # entry whose label no longer appears in the (relabeled) transcript.
+        try:
+            if recording.speaker_embeddings and is_json:
+                live_labels = {
+                    str(seg.get('speaker')).strip()
+                    for seg in transcription_data
+                    if seg.get('speaker') and str(seg.get('speaker')).strip()
+                }
+                emb = (json.loads(recording.speaker_embeddings)
+                       if isinstance(recording.speaker_embeddings, str)
+                       else recording.speaker_embeddings)
+                if isinstance(emb, dict):
+                    pruned = {lbl: v for lbl, v in emb.items() if lbl in live_labels}
+                    if len(pruned) != len(emb):
+                        dropped = sorted(set(emb) - set(pruned))
+                        recording.speaker_embeddings = json.dumps(pruned)
+                        current_app.logger.info(
+                            f"Pruned {len(dropped)} ghost speaker(s) with no transcript "
+                            f"items from recording {recording_id}: {dropped}"
+                        )
+        except Exception as e:
+            current_app.logger.error(f"Error pruning ghost speakers: {e}", exc_info=True)
+            # Best-effort — never fail the save over cosmetic cleanup
 
-        # Speaker names changed the transcription text — rebuild the Inquire
-        # chunks so semantic search answers with the applied names, not the
-        # raw SPEAKER_XX labels. Background + best-effort.
-        reindex_recording_chunks_async(recording_id)
+        _commit_with_retry(db.session)
 
         summary_queued = False
         if regenerate_summary:
@@ -875,6 +923,18 @@ def update_speakers(recording_id):
                 params={'user_id': current_user.id}
             )
             summary_queued = True
+
+        # clawd 2026-06-28: fire the Inquire reindex LAST, after this request's
+        # own writes (commit at line ~894 + the enqueue INSERT above) have
+        # committed. The reindex thread does a DELETE+bulk-INSERT on
+        # transcript_chunk; if started before the enqueue it races the same
+        # request's summary-job INSERT for SQLite's single writer and the
+        # enqueue 500s with "database is locked" (the 2026-06-28 regression —
+        # distinct from the 2026-06-26 transcribe-vs-save collision).
+        # Speaker names changed the transcription text — rebuild the Inquire
+        # chunks so semantic search answers with the applied names, not the
+        # raw SPEAKER_XX labels. Background + best-effort.
+        reindex_recording_chunks_async(recording_id)
 
         # Return recording with per-user status
         recording_dict = recording.to_dict(viewer_user=current_user)
@@ -947,11 +1007,7 @@ def update_transcript(recording_id):
         if speaker_names_used:
             update_speaker_usage(speaker_names_used)
 
-        db.session.commit()
-
-        # The transcript text changed — rebuild Inquire chunks so semantic
-        # search reflects the edits (names, corrections). Background + best-effort.
-        reindex_recording_chunks_async(recording_id)
+        _commit_with_retry(db.session)
 
         summary_queued = False
         if regenerate_summary:
@@ -967,6 +1023,12 @@ def update_transcript(recording_id):
         else:
             # Re-export the recording if auto-export is enabled
             export_recording(recording_id)
+
+        # clawd 2026-06-28: reindex LAST (after enqueue/export commits) — same
+        # same-request lock-race fix as update_speakers above.
+        # The transcript text changed — rebuild Inquire chunks so semantic
+        # search reflects the edits (names, corrections). Background + best-effort.
+        reindex_recording_chunks_async(recording_id)
 
         # Return recording with per-user status
         recording_dict = recording.to_dict(viewer_user=current_user)
@@ -1434,7 +1496,14 @@ def index():
         recording_chunk_seconds = 5
     recording_chunk_seconds = max(1, min(60, recording_chunk_seconds))
 
+    # FORK CHANGE (keep-screen-video): when KEEP_SCREEN_VIDEO=true, the in-app
+    # screen-share recorder ('system'/'both' modes) keeps the captured video
+    # track and records a video/webm instead of discarding video (upstream
+    # default). Off by default → behaviour identical to upstream Speakr.
+    keep_screen_video = os.environ.get('KEEP_SCREEN_VIDEO', 'false').lower() == 'true'
+
     return render_template('index.html',
+                         keep_screen_video=keep_screen_video,
                          use_asr_endpoint=USE_ASR_ENDPOINT,  # Backwards compat
                          connector_supports_diarization=connector_supports_diarization,
                          connector_supports_speaker_count=connector_supports_speaker_count,
