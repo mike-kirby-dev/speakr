@@ -104,8 +104,16 @@ export function useSpeakers(state, utils, processedTranscription) {
         speakerMap.value = {};
         speakerDisplayMap.value = {};
         speakers.forEach(speaker => {
+            // clawd 2026-07-28: pre-fill the name box for speakers that have
+            // ALREADY been named. update_speakers rewrites each segment's
+            // `speaker` field to the chosen name on save, so a label that is
+            // not a raw diariser ID (SPEAKER_00, SPEAKER_01, ...) IS the saved
+            // name. Seeding '' for those blanked every box on reopen, which
+            // (a) made you retype names you'd already set and (b) left the
+            // Save button dead until you did.
+            const isRawDiariserLabel = /^SPEAKER_\d+$/.test(speaker);
             speakerMap.value[speaker] = {
-                name: '',
+                name: isRawDiariserLabel ? '' : speaker,
                 isMe: false,
                 color: getSpeakerColor(speaker)
             };

@@ -845,10 +845,28 @@ def update_speakers(recording_id):
                     if name and not re.match(r'^SPEAKER_\d+$', name, re.IGNORECASE):
                         speaker_label_to_name[speaker_label] = name
 
-                # Update embeddings for each identified speaker
+                # clawd 2026-07-28: re-key the embedding map as we go.
+                #
+                # THE BUG: this handler rewrites each segment's `speaker` from
+                # SPEAKER_NN to the chosen name (~line 788) but left
+                # `recording.speaker_embeddings` keyed SPEAKER_NN forever. On a
+                # FIRST naming pass the submitted map is still keyed SPEAKER_NN
+                # so the join below works. On any LATER save the modal submits
+                # the current labels — which are now names — and the join finds
+                # nothing: enrolment silently no-ops and reports success. That
+                # is why reassigning speakers on an already-named recording
+                # taught the matcher nothing, and why 48 of 59 profiles had a
+                # name, a use_count and no voice (backfilled 2026-07-28).
+                #
+                # FIX: whenever we enrol under a name, rename that embedding
+                # key to match. The map then stays joinable for every future
+                # save (name -> name), and the association survives the
+                # transcript rewrite instead of being destroyed by it.
+                rekeyed = {}
                 for speaker_label, embedding in embeddings_data.items():
                     if speaker_label in speaker_label_to_name and embedding and len(embedding) == 256:
                         speaker_name = speaker_label_to_name[speaker_label]
+                        rekeyed[speaker_label] = speaker_name
 
                         # Find or create the speaker
                         speaker = Speaker.query.filter_by(
@@ -870,6 +888,19 @@ def update_speakers(recording_id):
                                 current_app.logger.info(
                                     f"Created initial voice profile for '{speaker_name}'"
                                 )
+
+                # clawd 2026-07-28: persist the re-keying (see note above).
+                # Renaming SPEAKER_NN -> "David Kirby" in the embedding map keeps
+                # it joinable against the transcript labels on every LATER save,
+                # so reassignments and re-namings keep enrolling instead of
+                # silently no-opping once the raw labels are gone.
+                if rekeyed:
+                    remapped = {rekeyed.get(k, k): v for k, v in embeddings_data.items()}
+                    recording.speaker_embeddings = json.dumps(remapped)
+                    current_app.logger.info(
+                        f"Re-keyed {len(rekeyed)} speaker embedding(s) to names: "
+                        f"{sorted(rekeyed.values())}"
+                    )
 
                 # Create snippets for identified speakers
                 if speaker_label_to_name:
@@ -1006,6 +1037,40 @@ def update_transcript(recording_id):
         # Update speaker usage statistics
         if speaker_names_used:
             update_speaker_usage(speaker_names_used)
+
+        # clawd 2026-07-28: enrol voiceprints from this save too.
+        #
+        # This handler (per-line speaker REASSIGNMENT) never enrolled at all —
+        # only update_speakers did. So correcting a misattributed line taught
+        # the voice matcher nothing, which was Mike's actual complaint: he kept
+        # re-naming the same people because their corrections never fed back.
+        #
+        # Safe because we only enrol where the embedding map key already matches
+        # a real name (i.e. this recording has been through the re-keying above,
+        # or the label was never renamed). We deliberately do NOT enrol a raw
+        # SPEAKER_NN slot here: when the diariser merges two people into one
+        # slot, that slot's embedding is a blend of both voices, and pushing it
+        # under whichever name the user picked would poison the profile. Those
+        # cases need a re-derive from the corrected segments' audio instead.
+        try:
+            if recording.speaker_embeddings:
+                emb = json.loads(recording.speaker_embeddings) if isinstance(recording.speaker_embeddings, str) else recording.speaker_embeddings
+                if isinstance(emb, str):        # some rows are double-encoded
+                    emb = json.loads(emb)
+                if isinstance(emb, dict):
+                    for key, vec in emb.items():
+                        if re.match(r'^SPEAKER_\d+$', str(key), re.IGNORECASE):
+                            continue            # raw slot — may be a blend, skip
+                        if not vec or len(vec) != 256:
+                            continue
+                        spk = Speaker.query.filter_by(user_id=current_user.id, name=key).first()
+                        if not spk:
+                            continue
+                        update_speaker_embedding(spk, vec, recording.id)
+                        current_app.logger.info(f"Enrolled voice sample for '{key}' from transcript edit")
+        except Exception as e:
+            current_app.logger.error(f"Voice enrolment on transcript update failed: {e}", exc_info=True)
+            # never fail the user's save because enrolment had a problem
 
         _commit_with_retry(db.session)
 
@@ -3517,7 +3582,11 @@ def get_job_queue_status():
                     ProcessingJob.completed_at >= cutoff_time
                 )
             )
-        ).order_by(ProcessingJob.created_at.desc()).all()
+        ).order_by(
+            ProcessingJob.status.desc(),
+            ProcessingJob.priority.desc(),
+            ProcessingJob.created_at.desc()
+        ).all()
 
         job_details = []
         for job in all_jobs:
@@ -3534,15 +3603,24 @@ def get_job_queue_status():
             if job.status == 'queued':
                 job_types = SUMMARY_JOBS if job.job_type in SUMMARY_JOBS else TRANSCRIPTION_JOBS
                 ahead_in_queue = ProcessingJob.query.filter(
+                    ProcessingJob.user_id == job.user_id,
                     ProcessingJob.status == 'queued',
                     ProcessingJob.job_type.in_(job_types),
-                    ProcessingJob.created_at < job.created_at
+                    db.or_(
+                        ProcessingJob.priority > job.priority,
+                        db.and_(
+                            ProcessingJob.priority == job.priority,
+                            db.or_(
+                                ProcessingJob.created_at < job.created_at,
+                                db.and_(
+                                    ProcessingJob.created_at == job.created_at,
+                                    ProcessingJob.id < job.id
+                                )
+                            )
+                        )
+                    )
                 ).count()
-                currently_processing = ProcessingJob.query.filter(
-                    ProcessingJob.status == 'processing',
-                    ProcessingJob.job_type.in_(job_types)
-                ).count()
-                position = ahead_in_queue + currently_processing + 1
+                position = ahead_in_queue + 1
 
             job_details.append({
                 'id': job.id,
@@ -3552,6 +3630,7 @@ def get_job_queue_status():
                 'job_type': job.job_type,
                 'queue_type': queue_type,
                 'position': position,
+                'priority': job.priority,
                 'is_new_upload': job.is_new_upload,
                 'error_message': job.error_message,
                 'created_at': job.created_at.isoformat() if job.created_at else None,
@@ -3562,6 +3641,55 @@ def get_job_queue_status():
         return jsonify({'jobs': job_details})
     except Exception as e:
         current_app.logger.error(f"Error fetching job queue status: {e}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred.'}), 500
+
+
+@recordings_bp.route('/api/recordings/jobs/<int:job_id>/promote', methods=['POST'])
+@login_required
+def promote_queued_job(job_id):
+    """Move a queued job to the front of its user's queue without touching active work."""
+    try:
+        from sqlalchemy import text as sql_text
+        from src.models import ProcessingJob
+        from src.services.job_queue import SUMMARY_JOBS, TRANSCRIPTION_JOBS
+
+        db.session.rollback()
+        if db.engine.dialect.name == 'sqlite':
+            db.session.execute(sql_text("BEGIN IMMEDIATE"))
+            job = db.session.get(ProcessingJob, job_id)
+        else:
+            job = ProcessingJob.query.filter_by(id=job_id).with_for_update().first()
+        if not job:
+            db.session.rollback()
+            return jsonify({'error': 'Job not found'}), 404
+        if job.user_id != current_user.id:
+            db.session.rollback()
+            return jsonify({'error': 'Access denied'}), 403
+        if job.status != 'queued':
+            db.session.rollback()
+            return jsonify({'error': 'This job has already started and cannot be reordered'}), 409
+
+        if db.engine.dialect.name != 'sqlite':
+            # Serialize promotions for this user so two requests cannot assign
+            # the same next priority on databases with row-level locking.
+            User.query.filter_by(id=current_user.id).with_for_update().one()
+
+        job_types = SUMMARY_JOBS if job.job_type in SUMMARY_JOBS else TRANSCRIPTION_JOBS
+        max_priority = db.session.query(db.func.max(ProcessingJob.priority)).filter(
+            ProcessingJob.user_id == current_user.id,
+            ProcessingJob.status == 'queued',
+            ProcessingJob.job_type.in_(job_types)
+        ).scalar() or 0
+        job.priority = max_priority + 1
+        db.session.commit()
+
+        current_app.logger.info(
+            f"Job {job_id} promoted to priority {job.priority} by user {current_user.id}"
+        )
+        return jsonify({'success': True, 'priority': job.priority})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error promoting job {job_id}: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected error occurred.'}), 500
 
 

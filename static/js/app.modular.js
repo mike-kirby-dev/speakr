@@ -2871,6 +2871,26 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
             };
 
+            // Move a queued job ahead of its current queue without touching active work.
+            const promoteJob = async (jobId) => {
+                try {
+                    const response = await fetch(`/api/recordings/jobs/${jobId}/promote`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    const data = await response.json();
+                    if (response.ok) {
+                        await fetchJobQueueStatus(true);
+                        showToast(safeT('progressQueue.movedToTop'), 'success');
+                    } else {
+                        showToast(data.error || safeT('progressQueue.failedToMove'), 'error');
+                    }
+                } catch (error) {
+                    console.error('Error promoting job:', error);
+                    showToast(safeT('progressQueue.failedToMove'), 'error');
+                }
+            };
+
             // Delete/clear a job
             const deleteJob = async (jobId) => {
                 try {
@@ -2951,6 +2971,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                                              unifiedStatus === 'summarizing' ? 'Generating summary...' :
                                              unifiedStatus === 'completed' ? 'Done' : 'Failed',
                             queuePosition: job.position,
+                            priority: job.priority || 0,
                             errorMessage: job.error_message,
                             friendlyError: job.error_message ? parseUnformattedError(job.error_message) : null,
                             completedAt: job.completed_at,
@@ -3091,6 +3112,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
             };
 
+            const promoteProgressItem = async (item) => {
+                if (item.jobId && item.status === 'queued') {
+                    await promoteJob(item.jobId);
+                }
+            };
+
             // Retry a failed item
             const retryProgressItem = async (item) => {
                 if (item.jobId) {
@@ -3135,6 +3162,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             // Speaker computed properties
             const hasSpeakerNames = computed(() => {
+                // clawd 2026-07-28: staged per-line speaker REASSIGNMENTS also count
+                // as savable work. changeSpeaker() stages into editedTranscriptData
+                // (speakers.js) and saveSpeakerNames() already routes to
+                // saveTranscriptEdits() when it's set — but this computed gated the
+                // Save button on typed names ONLY, so a session that just reassigns
+                // misidentified lines could never reach Save, and closeSpeakerModal
+                // then DISCARDED the staged edits against the on-open snapshot.
+                // Silent data loss for the commonest speaker-fixing workflow.
+                if (editedTranscriptData.value) return true;
+
                 // Check if any speaker has a non-empty name
                 return Object.values(speakerMap.value).some(speakerData =>
                     speakerData && speakerData.name && speakerData.name.trim() !== ''
@@ -3887,6 +3924,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 completedJobs,
                 failedJobs,
                 retryJob,
+                promoteJob,
                 deleteJob,
                 clearCompletedJobs,
                 recentlyCompletedBackend,
@@ -3899,6 +3937,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 failedProgressItems,
                 getStatusDisplay,
                 removeProgressItem,
+                promoteProgressItem,
                 retryProgressItem,
                 hasSpeakerNames,
                 showDuplicatesModal,
