@@ -3,7 +3,7 @@
 # the ENTIRE /app/src with the reconciled git checkout (branch
 # clawd/consolidate-hotpatches-20260718), so 100% of the application code is now
 # traceable to a repo commit, not to stacked throwaway Dockerfiles.
-FROM speakr-mk:lite
+FROM speakr-mk:enrolfix-20260728
 COPY src/ /app/src/
 COPY static/ /app/static/
 COPY templates/ /app/templates/

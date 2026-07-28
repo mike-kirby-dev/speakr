@@ -600,6 +600,7 @@ class FairJobQueue:
             # The session row was already flipped to 'failed' by the worker,
             # except in cases where stitch raised before touching it; do both
             # defensively.
+            from src.database import db
             from src.models import RecordingSession
             recording.status = 'FAILED'
             recording.transcription = f"Processing failed: {e}"
@@ -788,6 +789,7 @@ class FairJobQueue:
     def get_position_in_queue(self, recording_id: int) -> Optional[int]:
         """Get the position of a recording's job in its respective queue (1-indexed)."""
         with self._app_context():
+            from src.database import db
             from src.models import ProcessingJob
 
             job = ProcessingJob.query.filter(
