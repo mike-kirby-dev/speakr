@@ -1766,7 +1766,10 @@
     "uploadingShort": "werden hochgeladen",
     "transcribingShort": "werden transkribiert",
     "summarizingShort": "werden zusammengefasst",
-    "queuedShort": "in der Warteschlange"
+    "queuedShort": "in der Warteschlange",
+    "moveToTop": "Nach oben verschieben",
+    "movedToTop": "An den Anfang der Warteschlange verschoben",
+    "failedToMove": "Dieser Auftrag konnte nicht verschoben werden"
   },
   "floatingChat": {
     "dockLeft": "Links andocken",

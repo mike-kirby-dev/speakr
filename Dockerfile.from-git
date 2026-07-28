@@ -5,3 +5,5 @@
 # traceable to a repo commit, not to stacked throwaway Dockerfiles.
 FROM speakr-mk:lite
 COPY src/ /app/src/
+COPY static/ /app/static/
+COPY templates/ /app/templates/

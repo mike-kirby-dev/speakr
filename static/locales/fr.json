@@ -1766,7 +1766,10 @@
     "uploadingShort": "en cours d'envoi",
     "transcribingShort": "en transcription",
     "summarizingShort": "en résumé",
-    "queuedShort": "en attente"
+    "queuedShort": "en attente",
+    "moveToTop": "Déplacer en tête",
+    "movedToTop": "Déplacé en tête de la file",
+    "failedToMove": "Impossible de déplacer cette tâche"
   },
   "floatingChat": {
     "dockLeft": "Ancrer à gauche",

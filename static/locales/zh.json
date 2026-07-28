@@ -1766,7 +1766,10 @@
     "uploadingShort": "个正在上传",
     "transcribingShort": "个正在转录",
     "summarizingShort": "个正在生成摘要",
-    "queuedShort": "个排队中"
+    "queuedShort": "个排队中",
+    "moveToTop": "移到顶部",
+    "movedToTop": "已移到队列顶部",
+    "failedToMove": "无法移动此任务"
   },
   "floatingChat": {
     "dockLeft": "停靠左侧",

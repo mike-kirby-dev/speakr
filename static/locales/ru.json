@@ -1766,7 +1766,10 @@
     "uploadingShort": "загружается",
     "transcribingShort": "расшифровывается",
     "summarizingShort": "резюмируется",
-    "queuedShort": "в очереди"
+    "queuedShort": "в очереди",
+    "moveToTop": "Переместить наверх",
+    "movedToTop": "Перемещено в начало очереди",
+    "failedToMove": "Не удалось переместить задание"
   },
   "floatingChat": {
     "dockLeft": "Закрепить слева",

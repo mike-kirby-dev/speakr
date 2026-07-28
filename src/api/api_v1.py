@@ -1330,17 +1330,33 @@ def get_recording_status(recording_id):
 
     # Get queue position if pending/processing
     queue_position = None
-    if recording.status in ['PENDING', 'PROCESSING', 'SUMMARIZING']:
-        # Count jobs ahead of this one
+    if recording.status in ['PENDING', 'QUEUED', 'PROCESSING', 'SUMMARIZING']:
+        from src.services.job_queue import TRANSCRIPTION_JOBS, SUMMARY_JOBS
+
         job = ProcessingJob.query.filter_by(
             recording_id=recording_id,
             status='queued'
         ).first()
 
         if job:
+            job_types = SUMMARY_JOBS if job.job_type in SUMMARY_JOBS else TRANSCRIPTION_JOBS
             queue_position = ProcessingJob.query.filter(
+                ProcessingJob.user_id == job.user_id,
                 ProcessingJob.status == 'queued',
-                ProcessingJob.created_at < job.created_at
+                ProcessingJob.job_type.in_(job_types),
+                db.or_(
+                    ProcessingJob.priority > job.priority,
+                    db.and_(
+                        ProcessingJob.priority == job.priority,
+                        db.or_(
+                            ProcessingJob.created_at < job.created_at,
+                            db.and_(
+                                ProcessingJob.created_at == job.created_at,
+                                ProcessingJob.id < job.id
+                            )
+                        )
+                    )
+                )
             ).count() + 1
 
     return jsonify({

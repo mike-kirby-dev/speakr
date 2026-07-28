@@ -175,7 +175,8 @@ class FairJobQueue:
                     # autobegin txn first so BEGIN IMMEDIATE starts clean.
                     from sqlalchemy import text as _sql_text
                     db.session.rollback()
-                    db.session.execute(_sql_text("BEGIN IMMEDIATE"))
+                    if db.engine.dialect.name == 'sqlite':
+                        db.session.execute(_sql_text("BEGIN IMMEDIATE"))
 
                     # Get list of users with queued jobs of our types
                     users_with_jobs = db.session.query(
@@ -209,14 +210,19 @@ class FairJobQueue:
                     else:
                         next_user_id = user_ids[0]
 
-                    # Get oldest queued job of our types for this user
-                    candidate_job = ProcessingJob.query.filter(
+                    # Highest-priority job first, then preserve FIFO within a tier.
+                    candidate_query = ProcessingJob.query.filter(
                         ProcessingJob.user_id == next_user_id,
                         ProcessingJob.status == 'queued',
                         ProcessingJob.job_type.in_(job_types)
                     ).order_by(
-                        ProcessingJob.created_at
-                    ).first()
+                        ProcessingJob.priority.desc(),
+                        ProcessingJob.created_at,
+                        ProcessingJob.id
+                    )
+                    if db.engine.dialect.name != 'sqlite':
+                        candidate_query = candidate_query.with_for_update(skip_locked=True)
+                    candidate_job = candidate_query.first()
 
                     if candidate_job:
                         # Atomically claim the job - only succeeds if status is still 'queued'
@@ -781,11 +787,24 @@ class FairJobQueue:
             # Determine which queue this job is in
             job_types = SUMMARY_JOBS if job.job_type in SUMMARY_JOBS else TRANSCRIPTION_JOBS
 
-            # Count jobs of the same type created before this one
+            # Match the worker's priority/FIFO ordering within this user's queue.
             position = ProcessingJob.query.filter(
+                ProcessingJob.user_id == job.user_id,
                 ProcessingJob.status == 'queued',
                 ProcessingJob.job_type.in_(job_types),
-                ProcessingJob.created_at < job.created_at
+                db.or_(
+                    ProcessingJob.priority > job.priority,
+                    db.and_(
+                        ProcessingJob.priority == job.priority,
+                        db.or_(
+                            ProcessingJob.created_at < job.created_at,
+                            db.and_(
+                                ProcessingJob.created_at == job.created_at,
+                                ProcessingJob.id < job.id
+                            )
+                        )
+                    )
+                )
             ).count() + 1
 
             return position

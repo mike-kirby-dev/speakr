@@ -31,6 +31,9 @@ class ProcessingJob(db.Model):
     error_message = db.Column(db.Text, nullable=True)
     retry_count = db.Column(db.Integer, default=0, nullable=False)
 
+    # Higher values run first within a user's transcription/summary queue.
+    priority = db.Column(db.Integer, default=0, nullable=False, index=True)
+
     # Track if this is a new upload (vs reprocessing) - for cleanup on failure
     is_new_upload = db.Column(db.Boolean, default=False, nullable=False)
 
@@ -55,6 +58,7 @@ class ProcessingJob(db.Model):
             'job_type': self.job_type,
             'status': self.status,
             'retry_count': self.retry_count,
+            'priority': self.priority,
             'is_new_upload': self.is_new_upload,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'started_at': self.started_at.isoformat() if self.started_at else None,

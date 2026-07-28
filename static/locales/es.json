@@ -1766,7 +1766,10 @@
     "uploadingShort": "subiendo",
     "transcribingShort": "transcribiendo",
     "summarizingShort": "resumiendo",
-    "queuedShort": "en cola"
+    "queuedShort": "en cola",
+    "moveToTop": "Mover al principio",
+    "movedToTop": "Movido al principio de la cola",
+    "failedToMove": "No se pudo mover este trabajo"
   },
   "floatingChat": {
     "dockLeft": "Anclar a la izquierda",
