@@ -349,6 +349,7 @@
     "reprocessTranscription": "Reprocess transcription",
     "reprocessWithAsr": "Reprocess with ASR",
     "resetStuckProcessing": "Reset stuck processing",
+    "retryFailed": "Retry failed transcription",
     "saveChanges": "Save Changes",
     "saveCustomPrompt": "Save Custom Prompt",
     "saveNames": "Save Names",

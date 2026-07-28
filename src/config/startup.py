@@ -201,6 +201,25 @@ def initialize_recording_session_cleanup(app):
     app.logger.info("✅ Recording-session cleanup scheduler initialized")
 
 
+def is_worker_process():
+    """
+    True only inside a real WSGI server process (the one that serves requests
+    and owns the background job workers).
+
+    `src.app` runs run_startup_tasks() at import time, and the container
+    entrypoint imports it TWICE more before gunicorn ever starts — once for the
+    schema check, once via scripts/docker_create_admin.py. Each of those short
+    lived imports used to spin up the job queue and run orphan recovery, so a
+    single container restart burned THREE recoveries against a cap of three
+    (clawd 2026-07-28). Gunicorn sets SERVER_SOFTWARE in the master's environ
+    before loading the app (gunicorn/arbiter.py:52), so it is inherited by the
+    worker and visible at app-import time — verified empirically, not assumed.
+    Anything else (entrypoint imports, `python -c`, a shell, a test) is a
+    side-effect-free context that must not touch the queue.
+    """
+    return bool(os.environ.get('SERVER_SOFTWARE'))
+
+
 def run_startup_tasks(app):
     """Run all startup tasks that need to happen after app creation."""
     from src.models import SystemSetting
@@ -222,6 +241,15 @@ def run_startup_tasks(app):
             f"(max_file_size_mb={max_file_size_mb}, "
             f"max_audio_only_video_size_mb={max_audio_only_video_mb})"
         )
+
+        # Everything below spawns background threads and mutates job state.
+        # Only a real WSGI worker may do that — see is_worker_process().
+        if not is_worker_process():
+            app.logger.info(
+                "Startup: non-server process (no SERVER_SOFTWARE) — skipping job "
+                "queue, monitors and schedulers. App is import-only here."
+            )
+            return
 
         # Initialize job queue for background processing
         initialize_job_queue(app)

@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 TRANSCRIPTION_WORKERS = int(os.environ.get('JOB_QUEUE_WORKERS', '2'))
 SUMMARY_WORKERS = int(os.environ.get('SUMMARY_QUEUE_WORKERS', '2'))
 MAX_RETRIES = int(os.environ.get('JOB_MAX_RETRIES', '3'))
+# Separate budget for orphan recoveries (restarts), tracked in its own column
+# so a restart can never consume a real execution retry. A long transcription
+# legitimately survives several deploys; only a job that wedges before making
+# progress should ever exhaust this. See recover_orphaned_jobs().
+MAX_ORPHAN_RECOVERIES = int(os.environ.get('JOB_MAX_ORPHAN_RECOVERIES', '10'))
 POLL_INTERVAL = 1.0  # seconds between checking for new jobs
 
 # Job type categories.
@@ -697,15 +702,24 @@ class FairJobQueue:
                 # video audio-extraction holding the SQLite writer) never fails
                 # normally — it just gets orphan-recovered on every restart and
                 # re-wedges, holding the lock forever and blocking unrelated
-                # writes (speaker-saves). Count each recovery against retry_count
-                # and mark the job FAILED once it has burned MAX_RETRIES
-                # recoveries, so an immortal lock-hog can't survive N restarts.
-                job.retry_count = (job.retry_count or 0) + 1
-                if job.retry_count > MAX_RETRIES:
+                # writes (speaker-saves).
+                #
+                # clawd 2026-07-28: that cap counted against retry_count, the
+                # SAME budget as real execution failures, with MAX_RETRIES=3 —
+                # and every container restart ran this three times (entrypoint
+                # schema check + docker_create_admin + gunicorn each imported
+                # src.app). So TWO restarts silently failed any in-flight job.
+                # That killed 12 healthy group-coaching recordings, none of which
+                # ever reached the ASR box. Fixed on both sides: startup.py now
+                # gates initialisation to the real WSGI worker, and recoveries
+                # get their own generous budget so a deploy can never be
+                # mistaken for a job defect.
+                job.orphan_recovery_count = (job.orphan_recovery_count or 0) + 1
+                if job.orphan_recovery_count > MAX_ORPHAN_RECOVERIES:
                     job.status = 'failed'
                     job.started_at = None
                     job.error_message = (
-                        f"Marked failed after {job.retry_count - 1} orphan-recoveries "
+                        f"Marked failed after {job.orphan_recovery_count - 1} orphan-recoveries "
                         f"without completing (repeatedly wedged during startup/setup)."
                     )
                     # Surface the failure on the recording too, so it isn't stuck 'PROCESSING'.
@@ -718,7 +732,7 @@ class FairJobQueue:
                         pass
                     logger.error(
                         f"Orphaned {queue_name} job {job.id} (recording {job.recording_id}) "
-                        f"exceeded {MAX_RETRIES} recoveries — marking FAILED instead of reviving"
+                        f"exceeded {MAX_ORPHAN_RECOVERIES} recoveries — marking FAILED instead of reviving"
                     )
                 else:
                     job.status = 'queued'
@@ -726,7 +740,7 @@ class FairJobQueue:
                     recovered += 1
                     logger.info(
                         f"Recovered orphaned {queue_name} job {job.id} for recording "
-                        f"{job.recording_id} (recovery {job.retry_count}/{MAX_RETRIES})"
+                        f"{job.recording_id} (recovery {job.orphan_recovery_count}/{MAX_ORPHAN_RECOVERIES})"
                     )
 
             if orphaned:

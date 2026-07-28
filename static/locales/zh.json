@@ -348,6 +348,7 @@
     "reprocessTranscription": "重新处理转录",
     "reprocessWithAsr": "使用ASR重新处理",
     "resetStuckProcessing": "重置卡住的处理",
+    "retryFailed": "重试失败的转录",
     "saveChanges": "保存更改",
     "saveCustomPrompt": "保存自定义 prompt",
     "saveNames": "保存名称",

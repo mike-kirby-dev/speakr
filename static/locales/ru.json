@@ -348,6 +348,7 @@
     "reprocessTranscription": "Перегенерировать транскрипцию",
     "reprocessWithAsr": "Перегенерировать через ASR",
     "resetStuckProcessing": "Сбросить зависшую обработку",
+    "retryFailed": "Повторить неудачную расшифровку",
     "saveChanges": "Сохранить изменения",
     "saveCustomPrompt": "Сохранить пользовательский prompt",
     "saveNames": "Сохранить имена",

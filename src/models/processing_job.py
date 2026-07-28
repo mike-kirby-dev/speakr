@@ -31,6 +31,12 @@ class ProcessingJob(db.Model):
     error_message = db.Column(db.Text, nullable=True)
     retry_count = db.Column(db.Integer, default=0, nullable=False)
 
+    # Orphan recoveries (job was 'processing' when the app restarted) are
+    # counted separately from retry_count: a restart is not the job's fault,
+    # and mixing the two let three restarts fail a perfectly healthy
+    # transcription. See job_queue.recover_orphaned_jobs().
+    orphan_recovery_count = db.Column(db.Integer, default=0, nullable=False)
+
     # Higher values run first within a user's transcription/summary queue.
     priority = db.Column(db.Integer, default=0, nullable=False, index=True)
 
@@ -58,6 +64,7 @@ class ProcessingJob(db.Model):
             'job_type': self.job_type,
             'status': self.status,
             'retry_count': self.retry_count,
+            'orphan_recovery_count': self.orphan_recovery_count,
             'priority': self.priority,
             'is_new_upload': self.is_new_upload,
             'created_at': self.created_at.isoformat() if self.created_at else None,

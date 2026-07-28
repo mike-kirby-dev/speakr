@@ -236,6 +236,10 @@ def initialize_database(app):
         if add_column_if_not_exists(engine, 'processing_job', 'priority', 'INTEGER DEFAULT 0'):
             app.logger.info("Added priority column to processing_job table")
 
+        # Orphan recoveries get their own budget, separate from retry_count.
+        if add_column_if_not_exists(engine, 'processing_job', 'orphan_recovery_count', 'INTEGER DEFAULT 0'):
+            app.logger.info("Added orphan_recovery_count column to processing_job table")
+
         if add_column_if_not_exists(engine, 'tag', 'group_id', 'INTEGER'):
             app.logger.info("Added group_id column to tag table")
 

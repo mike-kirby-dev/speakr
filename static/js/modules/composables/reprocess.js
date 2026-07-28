@@ -119,6 +119,47 @@ export function useReprocess(state, utils) {
         }
     };
 
+    // =========================================
+    // Retry (re-queue the failed job itself)
+    // =========================================
+
+    const retryRecording = async (recording) => {
+        if (!recording) return;
+        const recordingId = recording.id;
+
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+            const response = await fetch(`/recording/${recordingId}/retry`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                }
+            });
+
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Failed to retry recording');
+
+            const newStatus = data.recording?.status || 'QUEUED';
+
+            const index = recordings.value.findIndex(r => r.id === recordingId);
+            if (index !== -1) {
+                recordings.value[index].status = newStatus;
+            }
+            if (selectedRecording.value?.id === recordingId) {
+                selectedRecording.value.status = newStatus;
+            }
+
+            const pos = data.queue_position;
+            showToast(
+                pos ? `Retry queued — position ${pos}` : 'Retry queued',
+                'fa-rotate-right'
+            );
+        } catch (error) {
+            setGlobalError(`Failed to retry: ${error.message}`);
+        }
+    };
+
     const executeReprocess = async () => {
         if (!reprocessRecording.value || !reprocessType.value) return;
 
@@ -521,6 +562,9 @@ export function useReprocess(state, utils) {
         confirmReset,
         cancelReset,
         executeReset,
+
+        // Retry
+        retryRecording,
 
         // Transcription
         reprocessTranscription,

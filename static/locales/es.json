@@ -348,6 +348,7 @@
     "reprocessTranscription": "Reprocesar transcripción",
     "reprocessWithAsr": "Reprocesar con ASR",
     "resetStuckProcessing": "Restablecer procesamiento bloqueado",
+    "retryFailed": "Reintentar transcripción fallida",
     "saveChanges": "Guardar Cambios",
     "saveCustomPrompt": "Guardar prompt personalizado",
     "saveNames": "Guardar Nombres",

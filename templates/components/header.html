@@ -145,6 +145,12 @@
                     :title="t('buttons.reprocessSummary')">
                 <i class="fas fa-sync-alt"></i>
             </button>
+            <button @click="retryRecording(selectedRecording)"
+                    v-if="selectedRecording && selectedRecording.can_edit !== false && selectedRecording.status === 'FAILED'"
+                    class="btn btn--icon hidden md:inline-flex" style="color: rgb(34, 197, 94);"
+                    :title="t('buttons.retryFailed')">
+                <i class="fas fa-rotate-right"></i>
+            </button>
             <button @click="confirmReset(selectedRecording)" v-if="['PENDING', 'PROCESSING', 'SUMMARIZING', 'FAILED'].includes(selectedRecording.status)"
                     class="btn btn--icon hidden md:inline-flex" style="color: rgb(249, 115, 22);"
                     :title="t('buttons.resetStuckProcessing')">

@@ -1052,22 +1052,62 @@ def update_transcript(recording_id):
         # slot, that slot's embedding is a blend of both voices, and pushing it
         # under whichever name the user picked would poison the profile. Those
         # cases need a re-derive from the corrected segments' audio instead.
+        # clawd 2026-07-28 (second pass): the SPEAKER_NN skip above was too
+        # blunt and was the whole reason Mike's names still weren't sticking.
+        # Naming a raw slot is the COMMON case — it is exactly what happens the
+        # first time you put a name to a voice — and skipping it meant the
+        # reassignment path enrolled almost nothing. Measured on live data:
+        # recs 63/73/74/75 all had real names in the transcript and a voiceprint
+        # map still keyed SPEAKER_00..09, zero overlap, so every enrolment
+        # no-opped and 10 people ended up named with embedding_count = 0.
+        #
+        # So: enrol through `speaker_map` (submitted label -> chosen name), the
+        # same join update_speakers uses, and re-key the embedding map to the
+        # chosen name so it stays joinable on every later save. The blend risk
+        # the old skip was guarding against is real but belongs to the diariser
+        # merging two voices into one slot; update_speaker_embedding already
+        # tracks per-sample similarity, and the modal path has always accepted
+        # this same exposure. Being stricter here just broke the common case.
         try:
-            if recording.speaker_embeddings:
-                emb = json.loads(recording.speaker_embeddings) if isinstance(recording.speaker_embeddings, str) else recording.speaker_embeddings
+            emb = recording.speaker_embeddings
+            if emb:
+                if isinstance(emb, str):
+                    emb = json.loads(emb)
                 if isinstance(emb, str):        # some rows are double-encoded
                     emb = json.loads(emb)
+
                 if isinstance(emb, dict):
+                    # label -> chosen name, from what the user just submitted
+                    label_to_name = {}
+                    for label, info in (speaker_map or {}).items():
+                        nm = (info.get('name') or '').strip() if isinstance(info, dict) else ''
+                        if isinstance(info, dict) and info.get('isMe') and not nm:
+                            nm = current_user.name or 'Me'
+                        if nm and not re.match(r'^SPEAKER_\d+$', nm, re.IGNORECASE):
+                            label_to_name[label] = nm
+
+                    rekeyed = {}
                     for key, vec in emb.items():
-                        if re.match(r'^SPEAKER_\d+$', str(key), re.IGNORECASE):
-                            continue            # raw slot — may be a blend, skip
-                        if not vec or len(vec) != 256:
+                        # A key already renamed to a real name stays joinable by
+                        # itself; a raw slot joins via the submitted map.
+                        name = label_to_name.get(key)
+                        if not name and not re.match(r'^SPEAKER_\d+$', str(key), re.IGNORECASE):
+                            name = key
+                        if not name:
                             continue
-                        spk = Speaker.query.filter_by(user_id=current_user.id, name=key).first()
+                        if not vec or not isinstance(vec, list) or len(vec) != 256:
+                            continue
+                        spk = Speaker.query.filter_by(user_id=current_user.id, name=name).first()
                         if not spk:
                             continue
                         update_speaker_embedding(spk, vec, recording.id)
-                        current_app.logger.info(f"Enrolled voice sample for '{key}' from transcript edit")
+                        rekeyed[key] = name
+                        current_app.logger.info(f"Enrolled voice sample for '{name}' from transcript edit")
+
+                    if rekeyed:
+                        recording.speaker_embeddings = json.dumps(
+                            {rekeyed.get(k, k): v for k, v in emb.items()}
+                        )
         except Exception as e:
             current_app.logger.error(f"Voice enrolment on transcript update failed: {e}", exc_info=True)
             # never fail the user's save because enrolment had a problem
@@ -1493,6 +1533,92 @@ def reset_status(recording_id):
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error resetting status for recording {recording_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@recordings_bp.route('/recording/<int:recording_id>/retry', methods=['POST'])
+@login_required
+def retry_recording(recording_id):
+    """
+    Re-queue the failed job for a recording so it actually runs again.
+
+    This is the button 'Reset stuck processing' was mistaken for. reset_status
+    only rewrites the recording's status label; it never touches processing_job,
+    so on an already-FAILED recording it is a visible no-op (clawd 2026-07-28).
+
+    Retry re-queues the EXISTING job row, preserving its original params, and
+    clears the counters that made it terminal. Re-running the original job is
+    what the user means by 'retry' — reprocess_transcription, by contrast,
+    mints a fresh job and wipes any transcription already present.
+    """
+    try:
+        from src.models import ProcessingJob
+        from src.services.job_queue import SUMMARY_JOBS
+
+        recording = db.session.get(Recording, recording_id)
+        if not recording:
+            return jsonify({'error': 'Recording not found'}), 404
+
+        if not has_recording_access(recording, current_user, require_edit=True):
+            return jsonify({'error': 'You do not have permission to modify this recording'}), 403
+
+        if recording.status in ['QUEUED', 'PROCESSING', 'SUMMARIZING']:
+            return jsonify({'error': 'Recording is already being processed'}), 400
+
+        # Newest failed job for this recording — the one the user is looking at.
+        job = ProcessingJob.query.filter(
+            ProcessingJob.recording_id == recording_id,
+            ProcessingJob.status == 'failed'
+        ).order_by(ProcessingJob.id.desc()).first()
+
+        if not job:
+            return jsonify({
+                'error': 'No failed job to retry for this recording. '
+                         'Use Reprocess to run it again from scratch.'
+            }), 404
+
+        # The source media must still exist, or the retry just re-fails.
+        if not recording.audio_path or not get_storage_service().exists(recording.audio_path):
+            return jsonify({'error': 'Audio file not found — cannot retry'}), 404
+
+        job.status = 'queued'
+        job.started_at = None
+        job.completed_at = None
+        job.error_message = None
+        # Give the retry a full budget; the previous counts are spent history.
+        job.retry_count = 0
+        job.orphan_recovery_count = 0
+
+        recording.status = 'SUMMARIZING' if job.job_type in SUMMARY_JOBS else 'QUEUED'
+        recording.error_message = None
+
+        db.session.commit()
+
+        # The worker polls the DB for queued jobs every second, so a committed
+        # row is picked up on its own — no in-memory enqueue needed. Make sure
+        # the workers are actually running though (they are not in a process
+        # that skipped startup init).
+        if not job_queue._running:
+            job_queue.start()
+
+        current_app.logger.info(
+            f"Retry: re-queued job {job.id} (type={job.job_type}) for recording {recording_id}"
+        )
+
+        recording_dict = recording.to_dict(viewer_user=current_user)
+        enrich_recording_dict_with_user_status(recording_dict, recording, current_user)
+        return jsonify({
+            'success': True,
+            'message': 'Retry queued',
+            'recording': recording_dict,
+            'job_id': job.id,
+            'queue_position': job_queue.get_position_in_queue(recording.id),
+            'queue_status': job_queue.get_queue_status()
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error retrying recording {recording_id}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 # --- Authentication Routes ---
