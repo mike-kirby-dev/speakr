@@ -99,14 +99,22 @@ def get_embedding_api_client():
 
     if _embedding_api_client is None:
         try:
+            import httpx
             from openai import OpenAI
-            from src.services.llm import llm_timeout, LLM_MAX_RETRIES, http_client_no_proxy
+            from src.services.llm import http_client_no_proxy
+            embedding_timeout = httpx.Timeout(
+                connect=30.0,
+                read=_API_EMBED_TIMEOUT_SECONDS,
+                write=30.0,
+                pool=30.0,
+            )
             _embedding_api_client = OpenAI(
                 api_key=EMBEDDING_API_KEY or "not-needed",
                 base_url=EMBEDDING_BASE_URL,
                 http_client=http_client_no_proxy,
-                timeout=llm_timeout,
-                max_retries=LLM_MAX_RETRIES,
+                timeout=embedding_timeout,
+                # _api_embed owns retries so the total deadline stays bounded.
+                max_retries=0,
             )
             current_app.logger.info(
                 f"Embedding API client initialized: base_url={EMBEDDING_BASE_URL}, model={EMBEDDING_MODEL}"
@@ -119,6 +127,8 @@ def get_embedding_api_client():
 
 _API_EMBED_MAX_ATTEMPTS = int(os.environ.get('EMBEDDING_API_MAX_RETRIES', '3'))
 _API_EMBED_BASE_BACKOFF_SECONDS = float(os.environ.get('EMBEDDING_API_BACKOFF_SECONDS', '1.5'))
+_API_EMBED_BATCH_SIZE = max(1, int(os.environ.get('EMBEDDING_API_BATCH_SIZE', '32')))
+_API_EMBED_TIMEOUT_SECONDS = float(os.environ.get('EMBEDDING_API_TIMEOUT', '60'))
 
 # Substrings of error messages that suggest the failure is transient and
 # worth retrying. Auth and model-not-found errors do not match and fail fast.
@@ -137,8 +147,8 @@ def _is_transient_embedding_error(exc):
     return any(hint in msg for hint in _TRANSIENT_ERROR_HINTS)
 
 
-def _api_embed(texts, user_id=None):
-    """Call the OpenAI-compatible embeddings endpoint and return numpy vectors.
+def _api_embed_batch(texts, user_id=None):
+    """Call the OpenAI-compatible embeddings endpoint for one bounded batch.
 
     Retries on transient errors (rate limits, timeouts, 5xx, connection
     blips) with exponential backoff. Auth or model-not-found errors fail
@@ -215,6 +225,17 @@ def _api_embed(texts, user_id=None):
     current_app.logger.error(f"Embedding API call exhausted retries: {last_exc}")
     return []
 
+
+def _api_embed(texts, user_id=None):
+    """Embed inputs in bounded batches while preserving provider order."""
+    vectors = []
+    for start in range(0, len(texts), _API_EMBED_BATCH_SIZE):
+        batch = texts[start:start + _API_EMBED_BATCH_SIZE]
+        batch_vectors = _api_embed_batch(batch, user_id=user_id)
+        if len(batch_vectors) != len(batch):
+            return []
+        vectors.extend(batch_vectors)
+    return vectors
 
 
 def chunk_transcription(transcription, max_chunk_length=500, overlap=50):

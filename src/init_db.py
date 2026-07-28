@@ -9,13 +9,10 @@ This module handles:
 """
 
 import os
-import fcntl
-import tempfile
 from sqlalchemy import text, inspect
 
 from src.database import db
 from src.models import Recording, TranscriptChunk, SystemSetting, User
-from src.services.embeddings import process_recording_chunks
 from src.utils import add_column_if_not_exists, migrate_column_type, create_index_if_not_exists
 
 # Configuration
@@ -235,6 +232,9 @@ def initialize_database(app):
         # Add is_new_upload column to processing_job table for tracking upload vs reprocessing jobs
         if add_column_if_not_exists(engine, 'processing_job', 'is_new_upload', 'BOOLEAN DEFAULT 0'):
             app.logger.info("Added is_new_upload column to processing_job table")
+
+        if add_column_if_not_exists(engine, 'processing_job', 'priority', 'INTEGER DEFAULT 0'):
+            app.logger.info("Added priority column to processing_job table")
 
         if add_column_if_not_exists(engine, 'tag', 'group_id', 'INTEGER'):
             app.logger.info("Added group_id column to tag table")
@@ -818,62 +818,21 @@ def initialize_database(app):
             db.session.rollback()
             app.logger.warning(f"transcription_language normalization migration skipped: {e}")
 
-        # Process existing recordings for inquire mode (chunk and embed them)
-        # Only run if inquire mode is enabled
         if ENABLE_INQUIRE_MODE:
-            # Use a file lock to prevent multiple workers from running this simultaneously
-            lock_file_path = os.path.join(tempfile.gettempdir(), 'inquire_migration.lock')
-            
-            try:
-                with open(lock_file_path, 'w') as lock_file:
-                    # Try to acquire exclusive lock (non-blocking)
-                    try:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        app.logger.info("Acquired migration lock, checking for existing recordings that need chunking for inquire mode...")
-                        
-                        completed_recordings = Recording.query.filter_by(status='COMPLETED').all()
-                        recordings_needing_processing = []
-                        
-                        for recording in completed_recordings:
-                            if recording.transcription:  # Has transcription
-                                chunk_count = TranscriptChunk.query.filter_by(recording_id=recording.id).count()
-                                if chunk_count == 0:  # No chunks yet
-                                    recordings_needing_processing.append(recording)
-                        
-                        if recordings_needing_processing:
-                            app.logger.info(f"Found {len(recordings_needing_processing)} recordings that need chunking for inquire mode")
-                            app.logger.info("Processing first 10 recordings automatically. Use admin API or migration script for remaining recordings.")
-                            
-                            # Process first 10 recordings automatically to avoid long startup times
-                            batch_size = min(10, len(recordings_needing_processing))
-                            processed = 0
-                            
-                            for i in range(batch_size):
-                                recording = recordings_needing_processing[i]
-                                try:
-                                    success = process_recording_chunks(recording.id)
-                                    if success:
-                                        processed += 1
-                                        app.logger.info(f"Processed chunks for recording: {recording.title} ({recording.id})")
-                                except Exception as e:
-                                    app.logger.warning(f"Failed to process chunks for recording {recording.id}: {e}")
-                            
-                            remaining = len(recordings_needing_processing) - processed
-                            if remaining > 0:
-                                app.logger.info(f"Successfully processed {processed} recordings. {remaining} recordings remaining.")
-                                app.logger.info("Use the admin migration API or run 'python migrate_existing_recordings.py' to process remaining recordings.")
-                            else:
-                                app.logger.info(f"Successfully processed all {processed} recordings for inquire mode.")
-                        else:
-                            app.logger.info("All existing recordings are already processed for inquire mode.")
-                        
-                    except BlockingIOError:
-                        app.logger.info("Migration already running in another worker, skipping...")
-                    
-            except Exception as e:
-                app.logger.warning(f"Error during existing recordings migration: {e}")
-                app.logger.info("Existing recordings can be migrated later using the admin API or migration script.")
-            
+            # Historical embedding backfills are network-bound and must not run
+            # during module import. Use the admin migration endpoint after the
+            # application is ready instead.
+            missing_chunks = db.session.query(Recording.id).filter(
+                Recording.status == 'COMPLETED',
+                Recording.transcription.isnot(None),
+                ~Recording.id.in_(db.session.query(TranscriptChunk.recording_id)),
+            ).count()
+            if missing_chunks:
+                app.logger.info(
+                    f"Inquire mode has {missing_chunks} recordings awaiting chunks; "
+                    "run the admin migration after startup."
+                )
+
     except Exception as e:
         app.logger.error(f"Error during database migration: {e}")
 

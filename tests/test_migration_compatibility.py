@@ -188,6 +188,14 @@ class TestMigrationCompatibility(unittest.TestCase):
             matches = re.findall(pattern, self.content, re.IGNORECASE)
             # Just informational - these are fine because the utility converts them
 
+    def test_inquire_backfill_does_not_run_during_startup(self):
+        """App import must not make network-bound embedding calls."""
+        self.assertNotIn(
+            'process_recording_chunks(',
+            self.content,
+            'Historical inquire backfill must run via the admin migration, not initialize_database().',
+        )
+
     def test_no_double_quoted_string_defaults(self):
         """
         Ensure no SQL DEFAULT values use double-quoted strings.

@@ -48,6 +48,7 @@ def reload_with_env(**env):
     """Reload the embeddings module with the requested env overrides."""
     keys = list(env.keys()) + [
         "EMBEDDING_MODEL", "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_DIMENSIONS",
+        "EMBEDDING_API_BATCH_SIZE", "EMBEDDING_API_TIMEOUT",
     ]
     saved = {k: os.environ.get(k) for k in keys}
     try:
@@ -133,6 +134,34 @@ def test_generate_embeddings_uses_api_when_active():
     assert "dimensions" not in call_kwargs
 
 
+def test_generate_embeddings_batches_api_requests_in_order():
+    emb = reload_with_env(
+        EMBEDDING_BASE_URL="http://localhost:9999/v1",
+        EMBEDDING_MODEL="bge-base",
+        EMBEDDING_API_BATCH_SIZE="2",
+    )
+    fake_client = MagicMock()
+
+    def response_for_batch(**kwargs):
+        response = MagicMock()
+        response.usage = None
+        response.data = [MagicMock(embedding=[float(text[1:])]) for text in kwargs["input"]]
+        return response
+
+    fake_client.embeddings.create.side_effect = response_for_batch
+    texts = [f"t{i}" for i in range(5)]
+
+    from flask import Flask
+    test_app = Flask(__name__)
+    with test_app.app_context():
+        with patch.object(emb, "get_embedding_api_client", return_value=fake_client):
+            vectors = emb.generate_embeddings(texts)
+
+    assert [float(vector[0]) for vector in vectors] == [0.0, 1.0, 2.0, 3.0, 4.0]
+    batches = [call.kwargs["input"] for call in fake_client.embeddings.create.call_args_list]
+    assert batches == [["t0", "t1"], ["t2", "t3"], ["t4"]]
+
+
 def test_generate_embeddings_passes_dimensions_when_set():
     emb = reload_with_env(
         EMBEDDING_BASE_URL="http://localhost:9999/v1",
@@ -169,6 +198,7 @@ def main():
     run("EMBEDDING_DIMENSIONS parses to int", test_dimensions_parsed)
     run("invalid EMBEDDING_DIMENSIONS falls back to None", test_dimensions_invalid_falls_back_to_none)
     run("generate_embeddings uses API client when active", test_generate_embeddings_uses_api_when_active)
+    run("API embedding requests are batched in order", test_generate_embeddings_batches_api_requests_in_order)
     run("generate_embeddings forwards dimensions when set", test_generate_embeddings_passes_dimensions_when_set)
     run("get_embedding_model returns None in API mode", test_get_embedding_model_returns_none_in_api_mode)
 
