@@ -975,6 +975,7 @@
     "startingAutoIdentification": "Starting automatic speaker identification...",
     "summaryGenerationFailed": "Summary generation failed",
     "summaryGenerationTimedOut": "Summary generation timed out",
+    "summaryQueuePosition": "Queued — position {n}",
     "summaryRegenerationStarted": "Summary regeneration started",
     "summaryUpdated": "Summary updated!",
     "systemAudioDesc": "Records meeting participants and system sounds",

@@ -975,6 +975,7 @@
     "startingAutoIdentification": "Запуск автоматического определения спикеров...",
     "summaryGenerationFailed": "Ошибка генерации резюме",
     "summaryGenerationTimedOut": "Превышено время генерации резюме",
+    "summaryQueuePosition": "В очереди — позиция {n}",
     "summaryRegenerationStarted": "Перегенерация резюме запущена",
     "summaryUpdated": "Резюме обновлено!",
     "systemAudioDesc": "Записывает участников встречи и системные звуки",

@@ -975,6 +975,7 @@
     "startingAutoIdentification": "Automatische Sprecheridentifikation wird gestartet...",
     "summaryGenerationFailed": "Zusammenfassungsgenerierung fehlgeschlagen",
     "summaryGenerationTimedOut": "Zeitüberschreitung bei der Zusammenfassungsgenerierung",
+    "summaryQueuePosition": "In Warteschlange — Position {n}",
     "summaryRegenerationStarted": "Neugenerierung der Zusammenfassung gestartet",
     "summaryUpdated": "Zusammenfassung aktualisiert!",
     "systemAudioDesc": "Nimmt Meeting-Teilnehmer und Systemklänge auf",

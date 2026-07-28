@@ -3637,8 +3637,18 @@ def get_recording_status_only(recording_id):
         if not has_recording_access(recording, current_user):
             return jsonify({'error': 'You do not have permission to view this recording'}), 403
 
-        # Return only the status field
-        return jsonify({'status': recording.status})
+        # Status plus queue position. The poller shows "position N in queue"
+        # rather than declaring a timeout: on a busy CPU box a summary routinely
+        # waits 10-15 min before it even starts (measured 819-961s on
+        # 2026-07-28), so a fixed client-side deadline was reporting healthy,
+        # still-queued work as failed. None once the job is actually running.
+        payload = {'status': recording.status}
+        try:
+            payload['queue_position'] = job_queue.get_position_in_queue(recording_id)
+        except Exception as e:
+            current_app.logger.warning(f"queue position lookup failed for {recording_id}: {e}")
+            payload['queue_position'] = None
+        return jsonify(payload)
     except Exception as e:
         current_app.logger.error(f"Error fetching status for recording {recording_id}: {e}", exc_info=True)
         return jsonify({'error': 'An unexpected error occurred.'}), 500

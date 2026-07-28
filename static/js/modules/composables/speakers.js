@@ -401,8 +401,14 @@ export function useSpeakers(state, utils, processedTranscription) {
 
     // Poll for summary completion after regeneration
     const pollForSummaryCompletion = async (recordingId) => {
-        const maxAttempts = 40; // Poll for up to 2 minutes (40 * 3 seconds)
+        // Ceiling exists only so a forgotten tab stops polling forever. It is
+        // deliberately far above any real summary: the old 2-minute limit fired
+        // constantly on queued work (measured queue waits of 13-16 min on
+        // 2026-07-28) and reported healthy jobs as timed out. While the job is
+        // still queued we report its position instead.
+        const maxAttempts = 1200; // 1 hour at 3s
         let attempts = 0;
+        let lastPosition = null;
 
         const pollInterval = setInterval(async () => {
             attempts++;
@@ -469,6 +475,19 @@ export function useSpeakers(state, utils, processedTranscription) {
                     // Stop polling after max attempts
                     clearInterval(pollInterval);
                     showToast(t('help.summaryGenerationTimedOut'), 'fa-clock', 3000, 'warning');
+                } else {
+                    // Still working. Surface the queue position so a long wait
+                    // reads as "5th in line", not as a stall. Only toast when
+                    // the number CHANGES, so a 15-minute wait produces a handful
+                    // of updates rather than one every 3 seconds.
+                    const pos = statusData.queue_position;
+                    if (pos && pos !== lastPosition) {
+                        lastPosition = pos;
+                        showToast(
+                            t('help.summaryQueuePosition').replace('{n}', pos),
+                            'fa-hourglass-half', 2500, 'info'
+                        );
+                    }
                 }
             } catch (error) {
                 console.error('Error polling for summary:', error);

@@ -975,6 +975,7 @@
     "startingAutoIdentification": "Identification automatique des orateurs en cours...",
     "summaryGenerationFailed": "Échec de la génération du résumé",
     "summaryGenerationTimedOut": "La génération du résumé a expiré",
+    "summaryQueuePosition": "En file d'attente — position {n}",
     "summaryRegenerationStarted": "Régénération du résumé lancée",
     "summaryUpdated": "Résumé mis à jour !",
     "systemAudioDesc": "Enregistre les participants à la réunion et les sons du système",
